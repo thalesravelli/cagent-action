@@ -1,0 +1,347 @@
+# Handles AI replies to feedback on review comments.
+# Triggered by workflow_run so it always runs in the base repo context
+# with full permissions and secrets — even for fork PRs in public repos.
+#
+# The triggering workflow (Self PR Review → capture-feedback) uploads
+# a pr-review-feedback artifact containing:
+#   feedback.json   — the raw comment payload
+#   metadata.json   — PR number, repo, comment IDs, author, is_agent flag
+
+name: Reply to Feedback
+
+on:
+  workflow_run:
+    workflows: ["Self PR Review"]
+    types: [completed]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  actions: read # Required to download artifacts from the triggering run
+
+jobs:
+  reply:
+    # Only run if the triggering workflow succeeded (artifact was uploaded)
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    env:
+      HAS_APP_SECRETS: ${{ secrets.CAGENT_REVIEWER_APP_ID != '' }}
+
+    steps:
+      # ----------------------------------------------------------------
+      # Download artifact from the triggering workflow run
+      # ----------------------------------------------------------------
+      - name: Download feedback artifact
+        id: download
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            const runId = context.payload.workflow_run.id;
+            const artifacts = await github.rest.actions.listWorkflowRunArtifacts({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: runId
+            });
+
+            const match = artifacts.data.artifacts.find(a => a.name === 'pr-review-feedback');
+            if (!match) {
+              console.log('⏭️ No pr-review-feedback artifact found — not a feedback event');
+              core.setOutput('found', 'false');
+              return;
+            }
+
+            const zip = await github.rest.actions.downloadArtifact({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              artifact_id: match.id,
+              archive_format: 'zip'
+            });
+
+            const fs = require('fs');
+            fs.writeFileSync('/tmp/feedback.zip', Buffer.from(zip.data));
+            core.setOutput('found', 'true');
+            console.log('✅ Downloaded feedback artifact');
+
+      - name: Extract artifact
+        if: steps.download.outputs.found == 'true'
+        shell: bash
+        run: |
+          mkdir -p /tmp/feedback
+          unzip -o /tmp/feedback.zip -d /tmp/feedback
+
+      # ----------------------------------------------------------------
+      # Read metadata and decide whether to proceed
+      # ----------------------------------------------------------------
+      - name: Read metadata
+        if: steps.download.outputs.found == 'true'
+        id: meta
+        shell: bash
+        run: |
+          if [ ! -f /tmp/feedback/metadata.json ]; then
+            echo "⏭️ No metadata.json in artifact — legacy artifact, skipping"
+            echo "proceed=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Extract fields from metadata
+          PR_NUMBER=$(jq -r '.pr_number' /tmp/feedback/metadata.json)
+          REPO=$(jq -r '.repo' /tmp/feedback/metadata.json)
+          PARENT_COMMENT_ID=$(jq -r '.parent_comment_id' /tmp/feedback/metadata.json)
+          COMMENT_ID=$(jq -r '.comment_id' /tmp/feedback/metadata.json)
+          AUTHOR=$(jq -r '.author' /tmp/feedback/metadata.json)
+          AUTHOR_TYPE=$(jq -r '.author_type' /tmp/feedback/metadata.json)
+          IS_AGENT=$(jq -r '.is_agent_comment' /tmp/feedback/metadata.json)
+          FILE_PATH=$(jq -r '.file_path' /tmp/feedback/metadata.json)
+          LINE=$(jq -r '.line' /tmp/feedback/metadata.json)
+
+          # Validate PR number is numeric
+          if ! [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || [ "$PR_NUMBER" -lt 1 ]; then
+            echo "::error::Invalid PR number: $PR_NUMBER"
+            echo "proceed=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Skip if not an agent comment or if commenter is a bot
+          if [ "$IS_AGENT" != "true" ] || [ "$AUTHOR_TYPE" = "Bot" ]; then
+            echo "⏭️ Not an agent comment reply or author is a bot — skipping"
+            echo "proceed=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "proceed=true" >> $GITHUB_OUTPUT
+          echo "pr_number=$PR_NUMBER" >> $GITHUB_OUTPUT
+          echo "repo=$REPO" >> $GITHUB_OUTPUT
+          echo "parent_comment_id=$PARENT_COMMENT_ID" >> $GITHUB_OUTPUT
+          echo "comment_id=$COMMENT_ID" >> $GITHUB_OUTPUT
+          echo "author=$AUTHOR" >> $GITHUB_OUTPUT
+          echo "file_path=$FILE_PATH" >> $GITHUB_OUTPUT
+          echo "line=$LINE" >> $GITHUB_OUTPUT
+
+          echo "✅ Metadata loaded: PR #$PR_NUMBER, comment $COMMENT_ID by @$AUTHOR"
+
+      # ----------------------------------------------------------------
+      # Add 👀 reaction so the user knows their reply was received
+      # ----------------------------------------------------------------
+      - name: Add eyes reaction
+        if: steps.meta.outputs.proceed == 'true'
+        continue-on-error: true
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        env:
+          COMMENT_ID: ${{ steps.meta.outputs.comment_id }}
+          REPO: ${{ steps.meta.outputs.repo }}
+        with:
+          script: |
+            const [owner, repo] = process.env.REPO.split('/');
+            await github.rest.reactions.createForPullRequestReviewComment({
+              owner,
+              repo,
+              comment_id: parseInt(process.env.COMMENT_ID, 10),
+              content: 'eyes'
+            });
+            console.log('👀 Added eyes reaction to triggering comment');
+
+      # ----------------------------------------------------------------
+      # Authorization check via org membership
+      # ----------------------------------------------------------------
+      - name: Check authorization
+        if: steps.meta.outputs.proceed == 'true'
+        id: auth
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        env:
+          USERNAME: ${{ steps.meta.outputs.author }}
+        with:
+          github-token: ${{ secrets.CAGENT_ORG_MEMBERSHIP_TOKEN }}
+          script: |
+            const org = 'docker';
+            const username = process.env.USERNAME;
+
+            try {
+              await github.rest.orgs.checkMembershipForUser({ org, username });
+              core.setOutput('authorized', 'true');
+              console.log(`✅ ${username} is a ${org} org member — authorized`);
+            } catch (error) {
+              if (error.status === 404 || error.status === 302) {
+                core.setOutput('authorized', 'false');
+                console.log(`⏭️ ${username} is not a ${org} org member — not authorized`);
+              } else if (error.status === 401) {
+                core.warning('CAGENT_ORG_MEMBERSHIP_TOKEN secret is missing or invalid');
+                core.setOutput('authorized', 'false');
+              } else {
+                core.warning(`Failed to check org membership: ${error.message}`);
+                core.setOutput('authorized', 'false');
+              }
+            }
+
+      - name: Notify unauthorized user
+        if: steps.meta.outputs.proceed == 'true' && steps.auth.outputs.authorized == 'false'
+        continue-on-error: true
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        env:
+          PR_NUMBER: ${{ steps.meta.outputs.pr_number }}
+          REPO: ${{ steps.meta.outputs.repo }}
+          ROOT_COMMENT_ID: ${{ steps.meta.outputs.parent_comment_id }}
+          AUTHOR: ${{ steps.meta.outputs.author }}
+        with:
+          script: |
+            const [owner, repo] = process.env.REPO.split('/');
+            const body = 'Sorry @' + process.env.AUTHOR + ', conversational replies are currently available to repository collaborators only. Your feedback has still been captured and will be used to improve future reviews.\n\n<!-- cagent-review-reply -->';
+            await github.rest.pulls.createReplyForReviewComment({
+              owner,
+              repo,
+              pull_number: parseInt(process.env.PR_NUMBER, 10),
+              comment_id: parseInt(process.env.ROOT_COMMENT_ID, 10),
+              body
+            });
+
+      # ----------------------------------------------------------------
+      # Build thread context from API data
+      # ----------------------------------------------------------------
+      - name: Build thread context
+        if: steps.meta.outputs.proceed == 'true' && steps.auth.outputs.authorized == 'true'
+        id: thread
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ROOT_ID: ${{ steps.meta.outputs.parent_comment_id }}
+          PR_NUMBER: ${{ steps.meta.outputs.pr_number }}
+          REPO: ${{ steps.meta.outputs.repo }}
+          FILE_PATH: ${{ steps.meta.outputs.file_path }}
+          LINE: ${{ steps.meta.outputs.line }}
+          TRIGGER_COMMENT_ID: ${{ steps.meta.outputs.comment_id }}
+        run: |
+          # Read the triggering comment body and author from the saved artifact
+          TRIGGER_COMMENT_BODY=$(jq -r '.body // ""' /tmp/feedback/feedback.json)
+          TRIGGER_COMMENT_AUTHOR=$(jq -r '.user.login // ""' /tmp/feedback/feedback.json)
+
+          if [ -z "$TRIGGER_COMMENT_BODY" ]; then
+            echo "::error::Triggering comment body is empty or missing"
+            exit 1
+          fi
+
+          # Fetch the root comment
+          root=$(gh api "repos/$REPO/pulls/comments/$ROOT_ID") || {
+            echo "::error::Failed to fetch root comment $ROOT_ID" >&2
+            exit 1
+          }
+          root_body=$(echo "$root" | jq -r '.body // ""')
+
+          # Fetch all review comments on this PR and filter to this thread
+          all_comments=$(gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/comments" | \
+            jq -s --arg root_id "$ROOT_ID" \
+            '[.[][] | select(.in_reply_to_id == ($root_id | tonumber))] | sort_by(.created_at)') || {
+            echo "::error::Failed to fetch thread comments for PR $PR_NUMBER" >&2
+            exit 1
+          }
+
+          # Build the thread context
+          DELIM="THREAD_CONTEXT_$(openssl rand -hex 8)"
+
+          {
+            echo "prompt<<$DELIM"
+            echo "A developer replied to your review comment. Read the thread context below and respond"
+            echo "in the same thread."
+            echo ""
+            echo "---"
+            echo "REPO=$REPO"
+            echo "PR_NUMBER=$PR_NUMBER"
+            echo "ROOT_COMMENT_ID=$ROOT_ID"
+            echo "FILE_PATH=$FILE_PATH"
+            echo "LINE=$LINE"
+            echo ""
+            echo "[ORIGINAL REVIEW COMMENT]"
+            echo "$root_body"
+            echo ""
+
+            reply_count=$(echo "$all_comments" | jq 'length')
+            if [ "$reply_count" -gt 0 ]; then
+              for i in $(seq 0 $((reply_count - 1))); do
+                comment_id=$(echo "$all_comments" | jq -r ".[$i].id") || continue
+                # Skip the triggering comment — we append it from the artifact below
+                if [ "$comment_id" = "$TRIGGER_COMMENT_ID" ]; then
+                  continue
+                fi
+                user_type=$(echo "$all_comments" | jq -r ".[$i].user.type") || continue
+                author=$(echo "$all_comments" | jq -r ".[$i].user.login") || continue
+                body=$(echo "$all_comments" | jq -r ".[$i].body") || continue
+                if [ "$user_type" = "Bot" ]; then
+                  echo "[YOUR PREVIOUS REPLY by @$author]"
+                else
+                  echo "[REPLY by @$author]"
+                fi
+                echo "$body"
+                echo ""
+              done
+            fi
+
+            echo "[REPLY by @$TRIGGER_COMMENT_AUTHOR] ← this is the reply you are responding to"
+            echo "$TRIGGER_COMMENT_BODY"
+            echo ""
+            echo "$DELIM"
+          } >> $GITHUB_OUTPUT
+
+          echo "✅ Built thread context with replies"
+
+      # ----------------------------------------------------------------
+      # Checkout and run reply agent
+      # ----------------------------------------------------------------
+      - name: Checkout PR head
+        if: steps.meta.outputs.proceed == 'true' && steps.auth.outputs.authorized == 'true'
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          ref: refs/pull/${{ steps.meta.outputs.pr_number }}/head
+
+      - name: Generate GitHub App token
+        if: steps.meta.outputs.proceed == 'true' && steps.auth.outputs.authorized == 'true' && env.HAS_APP_SECRETS == 'true'
+        id: app-token
+        continue-on-error: true
+        uses: tibdex/github-app-token@3beb63f4bd073e61482598c45c71c1019b59b73a # v2
+        with:
+          app_id: ${{ secrets.CAGENT_REVIEWER_APP_ID }}
+          private_key: ${{ secrets.CAGENT_REVIEWER_APP_PRIVATE_KEY }}
+
+      - name: Run reply
+        if: steps.meta.outputs.proceed == 'true' && steps.auth.outputs.authorized == 'true' && steps.checkout.outcome == 'success' && steps.thread.outcome == 'success'
+        id: run-reply
+        continue-on-error: true
+        uses: ./review-pr/reply
+        with:
+          thread-context: ${{ steps.thread.outputs.prompt }}
+          comment-id: ${{ steps.meta.outputs.comment_id }}
+          anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          google-api-key: ${{ secrets.GOOGLE_API_KEY }}
+          aws-bearer-token-bedrock: ${{ secrets.AWS_BEARER_TOKEN_BEDROCK }}
+          xai-api-key: ${{ secrets.XAI_API_KEY }}
+          nebius-api-key: ${{ secrets.NEBIUS_API_KEY }}
+          mistral-api-key: ${{ secrets.MISTRAL_API_KEY }}
+          github-token: ${{ steps.app-token.outputs.token || github.token }}
+
+      # ----------------------------------------------------------------
+      # Failure handling
+      # ----------------------------------------------------------------
+      - name: React on failure
+        if: >-
+          always() &&
+          steps.meta.outputs.proceed == 'true' &&
+          steps.auth.outputs.authorized == 'true' &&
+          (steps.checkout.outcome == 'failure' || steps.thread.outcome == 'failure' || steps.run-reply.outcome == 'failure')
+        continue-on-error: true
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        env:
+          COMMENT_ID: ${{ steps.meta.outputs.comment_id }}
+          REPO: ${{ steps.meta.outputs.repo }}
+        with:
+          github-token: ${{ steps.app-token.outputs.token || github.token }}
+          script: |
+            const [owner, repo] = process.env.REPO.split('/');
+            await github.rest.reactions.createForPullRequestReviewComment({
+              owner,
+              repo,
+              comment_id: parseInt(process.env.COMMENT_ID, 10),
+              content: 'confused'
+            });
+            console.log('😕 Reply failed — added confused reaction');
