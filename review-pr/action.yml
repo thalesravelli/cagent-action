@@ -780,7 +780,7 @@ runs:
         trusted-bot-app-id: ${{ inputs.trusted-bot-app-id }}
         extra-args: ${{ inputs.model && format('--model={0}', inputs.model) || '' }}
         add-prompt-files: ${{ inputs.add-prompt-files }}
-        max-retries: "0"  # Disable retries — the review agent recovers internally (root falls back when sub-agents fail), so retrying the pipeline produces duplicate reviews
+        max-retries: "1"  # One retry handles transient API failures (e.g. Anthropic 400s) without risking duplicate reviews from full pipeline restarts
         skip-summary: "true"
 
     - name: Release review lock
