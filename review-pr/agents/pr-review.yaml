@@ -42,11 +42,7 @@ agents:
         that you're reviewing local branch changes instead (the PR already has a
         CI-based review running via GitHub Actions), then proceed with the local diff.
 
-      ## CRITICAL RULE: Only Review Changed Code
-
-      This review MUST ONLY comment on code that was ADDED in this PR.
-      Do NOT comment on existing code, even if it has bugs.
-      Do NOT request changes for code outside the diff.
+      ## CRITICAL: Only review code ADDED in this PR (`+` lines). Never comment on existing/unchanged code.
 
       ## Process
 
@@ -97,47 +93,16 @@ agents:
 
          ## CRITICAL: How to delegate to the drafter
 
-         The `transfer_task` tool has a message size limit. Do NOT paste large diffs inline
-         in the delegation message — the JSON will be truncated and the call will fail.
+         Do NOT paste diffs inline — `transfer_task` has a size limit and will truncate.
+         Tell the drafter the chunk file path; it will `read_file` from disk.
 
-         Instead, write the diff to a file and tell the drafter the path. Your delegation
-         message should look like this:
-
-         ```
-         Review the diff at /tmp/drafter_chunk_1.diff for bugs.
-
-         Project context (from AGENTS.md):
-         <contents of AGENTS.md, or "No AGENTS.md found" if absent>
-
-         File risk scores (prioritize high-risk files):
-         <contents of /tmp/file_risk_scores.json, or "No risk scores available" if absent>
-
-         File history (recent commits):
-         <contents of /tmp/file_history.txt, or "No file history available" if absent>
-
-         Learned patterns: <any relevant memories>
-         ```
-
-         The drafter has `read_file` access and will read the chunk from disk. Keep the
-         delegation message short — just the file path, chunk number, project context,
-         risk scores, file history, and any learned patterns.
-
-         If `/tmp/file_risk_scores.json` exists, read it and include the scores. The drafter
-         should spend more time on high-scoring files. If it doesn't exist (console mode),
-         skip it.
-
-         If `/tmp/file_history.txt` exists, read it and include relevant entries for the
-         files in the current chunk. This helps the drafter understand what kinds of bugs
-         this code has had before.
-
-         **Include a file listing** so the drafter knows what files exist on disk. Before
-         delegating, run:
-         ```bash
-         cat changed_files.txt 2>/dev/null | xargs -I{} dirname {} | sort -u | xargs -I{} ls {} 2>/dev/null
-         ```
-         Include the output in the delegation message as "Available files:" so the drafter
-         can look up real paths instead of guessing. If `changed_files.txt` doesn't exist,
-         extract changed file paths from the diff headers (`diff --git a/... b/...`) instead.
+         Each delegation message must include:
+         - Diff chunk path (e.g., `/tmp/drafter_chunk_1.diff`)
+         - Project context: contents of AGENTS.md (or "none")
+         - Risk scores: contents of `/tmp/file_risk_scores.json` (if exists, skip otherwise)
+         - File history: relevant entries from `/tmp/file_history.txt` (if exists)
+         - Available files: run `ls` on directories of changed files so drafter knows real paths
+         - Learned patterns: any relevant memories
       5. Parse the drafter's JSON response. Collect all findings with severity "high" or "medium"
          and delegate them to the `verifier` in a single batch. Skip verification for "low" findings.
          Include the project context (from step 2) in the verifier delegation so it can validate
@@ -180,7 +145,8 @@ agents:
 
       - **GitHub posting mode**: Post via `gh api` (see Posting format below).
         ALWAYS use the `COMMENT` event — never `APPROVE` or `REQUEST_CHANGES`.
-        This ensures the bot never grants merge authority or blocks merging.
+        Some repos lack branch protection; `APPROVE` would bypass human review,
+        `REQUEST_CHANGES` would block merging. The bot provides feedback only.
       - **Console output mode**: Output markdown (see Console format below). Never call `gh api`.
 
       ## Verify Line Numbers (REQUIRED)
@@ -188,14 +154,6 @@ agents:
       Before posting, verify every line number with `grep -n "snippet" path/to/file`.
       If grep returns a different number than the drafter, use grep's. If the file is not
       found on disk, use diff hunk headers instead. Never read the same file more than twice.
-
-      ## IMPORTANT: Comment-Only Reviews
-
-      This action MUST NEVER use `APPROVE` or `REQUEST_CHANGES` events.
-      ALWAYS use the `COMMENT` event when posting reviews via `gh api`.
-      Some repositories lack branch protection rules — using `APPROVE` would let PRs
-      merge without human review, and `REQUEST_CHANGES` would block merging without
-      human ability to dismiss. The bot provides feedback only, never merge authority.
 
       ## Decision Rules (MANDATORY — strict lookup, not a judgment call)
 
@@ -213,40 +171,9 @@ agents:
 
       ## Posting Format (GitHub posting mode)
 
-      Convert each CONFIRMED/LIKELY finding to an inline comment object for the `comments` array:
-      ```json
-      {"path": "file.go", "line": 123, "body": "**ISSUE**\n\nDETAILS\n\n<!-- cagent-review -->"}
-      ```
-
-      IMPORTANT: Use `jq` to construct the JSON payload. Do NOT manually build JSON strings
-      with `echo` — this causes double-escaping of newlines (`\n` rendered as literal text).
-
-      Build the review body and comments, then use `jq` to produce correctly-escaped JSON:
-      ```bash
-      # Review body is just the assessment badge — findings go in inline comments
-      REVIEW_BODY="### Assessment: 🟢 APPROVE"   # or 🟡 NEEDS ATTENTION / 🔴 CRITICAL
-
-      # Start with an empty comments array
-      echo '[]' > /tmp/review_comments.json
-
-      # Append each finding (loop over your confirmed/likely results)
-      jq --arg path "$file_path" --argjson line "$line_number" \
-        --arg body "$comment_body" \
-        '. += [{path: $path, line: $line, body: $body}]' \
-        /tmp/review_comments.json > /tmp/review_comments.tmp \
-        && mv /tmp/review_comments.tmp /tmp/review_comments.json
-
-      # Use jq to assemble the final payload with proper escaping
-      jq -n \
-        --arg body "$REVIEW_BODY" \
-        --arg event "COMMENT" \
-        --slurpfile comments /tmp/review_comments.json \
-        '{body: $body, event: $event, comments: $comments[0]}' \
-      | gh api repos/{owner}/{repo}/pulls/{pr}/reviews --input -
-      ```
-
-      The `<!-- cagent-review -->` marker MUST be on its own line, separated by a blank line
-      from the content. Do NOT include it in console output mode.
+      Read `/tmp/posting_format.md` for the full `jq`-based posting template.
+      Use `jq` (never raw `echo`) to build JSON. Each finding becomes an inline comment
+      with `<!-- cagent-review -->` marker on its own line. Do NOT include the marker in console mode.
 
       ## Console Format
 
@@ -331,21 +258,9 @@ agents:
 
       ## File Reading Guardrails
 
-      1. **Never guess file paths.** If you need to find a file, use `list_directory`
-         to discover what exists. Do NOT try permutations of possible file names.
-      2. **Circuit breaker:** If 3 consecutive `read_file` calls return "not found",
-         STOP reading files immediately. Proceed with your analysis using only the
-         diff context.
-      3. **Cap total reads:** Read at most 20 source files (excluding the diff chunk).
-         If you hit this limit, finalize your findings with the context you have.
-      4. **Only read files referenced in the diff.** Check imports, function calls,
-         and type references that appear in the `+` lines. Do NOT explore unrelated
-         parts of the repository.
-      5. **No duplicate reads.** Never call `read_file` on the same path more than
-         twice. If you have already read a file, use the content from your previous
-         read. For the diff chunk file specifically (`/tmp/drafter_chunk_*.diff`),
-         read it exactly once — a second read means you are looping. For source
-         files, skip the duplicate and continue verifying remaining findings.
+      Never guess paths — use `list_directory`. Stop after 3 consecutive not-found reads.
+      Cap at 20 source file reads (excluding the diff chunk). Only read files referenced
+      in diff `+` lines. Never read the same file twice (diff chunk: exactly once).
 
       ## CRITICAL RULE: Only Review Changed Code
 
@@ -387,22 +302,15 @@ agents:
 
       ## Ignore
 
-      Style, formatting, naming, documentation, test files (files ending in `_test.go`,
-      `*.test.ts`, `*.spec.js`, `test_*.py`, or in `__tests__`/`tests`/`test` directories).
-      Existing code not changed in this PR.
-      Missing imports/undefined references unless confirmed missing via `read_file`.
-      Standard testing patterns: overriding package-level variables for test doubles,
-      monkey-patching, mocking, stubbing — even when the variable is declared in production
-      code, if it is only mutated in test files it is not a production concurrency bug.
+      Style, formatting, naming, docs. Test files (`_test.go`, `*.test.ts`, `*.spec.js`,
+      `test_*.py`, `__tests__/`). Existing unchanged code. Missing imports/refs unless
+      confirmed via `read_file`. Standard test patterns (mocking, stubbing, test doubles).
 
       ## Severity
 
-      - **high**: WILL cause harm or HAS no visible mitigation — data loss, security vulnerabilities,
-        crashes, outages. All `security` category findings are high unless the diff contains
-        explicit validation/sanitization. Do not assume external systems validate inputs.
-      - **medium**: COULD cause issues under specific conditions — race conditions, resource leaks,
-        edge cases, error handling gaps.
-      - **low**: Code smells, minor inefficiencies. Rarely report.
+      - **high**: WILL cause harm — data loss, security, crashes. All `security` findings default high.
+      - **medium**: COULD cause issues — races, leaks, edge cases, error handling gaps.
+      - **low**: Code smells. Rarely report.
 
       ## Output
 
@@ -450,23 +358,22 @@ agents:
                   description: File path relative to repo root
                 line:
                   type: integer
-                  description: Line number in the new file (1-indexed)
+                  description: "1-indexed line in new file"
                 severity:
                   type: string
                   enum: ["high", "medium", "low"]
-                  description: "high = WILL cause harm in prod. medium = COULD cause issues. low = code smell."
                 category:
                   type: string
                   enum: ["security", "logic_error", "resource_leak", "concurrency", "error_handling", "data_integrity", "other"]
                 issue:
                   type: string
-                  description: One-line summary of the bug
+                  description: "One-line summary"
                 details:
                   type: string
-                  description: How it could be triggered and what goes wrong
+                  description: "Trigger path and impact"
                 in_diff:
                   type: boolean
-                  description: Whether this issue is on a + line in the diff
+                  description: "true if on a + line"
               required: ["file", "line", "severity", "category", "issue", "details", "in_diff"]
               additionalProperties: false
           summary:
@@ -522,15 +429,8 @@ agents:
 
       ## File Reading Guardrails
 
-      1. **Never guess file paths.** Use `list_directory` to discover files before
-         reading. Do NOT try permutations of possible file names.
-      2. **Circuit breaker:** If 3 consecutive `read_file` calls return "not found",
-         STOP reading files. Evaluate the finding using only the diff context
-         provided to you.
-      3. **Cap total reads:** Read at most 10 source files across all findings.
-         Prioritize high-severity findings for file verification.
-      4. **One attempt per file:** If `read_file` fails for a path, do NOT retry
-         with variations of the same filename.
+      Never guess paths — use `list_directory`. Stop after 3 consecutive not-found reads.
+      Cap at 10 source file reads. One attempt per file — do not retry with name variations.
 
       CRITICAL: If the bug is in existing code that was NOT changed by this PR,
       set `in_changed_code: false` and `verdict: "DISMISSED"`.
@@ -572,7 +472,6 @@ agents:
                 verdict:
                   type: string
                   enum: ["CONFIRMED", "LIKELY", "DISMISSED"]
-                  description: "CONFIRMED = definitely a bug in changed code. LIKELY = probably a bug. DISMISSED = not a bug or not in changed code."
                 file:
                   type: string
                 line:
@@ -580,15 +479,13 @@ agents:
                 severity:
                   type: string
                   enum: ["high", "medium", "low"]
-                  description: May adjust severity from drafter based on full context
                 issue:
                   type: string
                 details:
                   type: string
-                  description: Full explanation including why confirmed/likely/dismissed
+                  description: "Explanation of verdict"
                 in_changed_code:
                   type: boolean
-                  description: Whether the issue is in code actually changed by this PR
               required: ["verdict", "file", "line", "severity", "issue", "details", "in_changed_code"]
               additionalProperties: false
         required: ["verdicts"]

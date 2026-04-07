@@ -773,6 +773,11 @@ runs:
           echo "PROMPT_EOF"
         } >> $GITHUB_OUTPUT
 
+    - name: Copy posting format reference
+      if: steps.lock-check.outputs.skip != 'true'
+      shell: bash
+      run: cp "${{ github.action_path }}/agents/refs/posting-format.md" /tmp/posting_format.md
+
     # ========================================
     # RUN REVIEW using root cagent-action
     # ========================================
