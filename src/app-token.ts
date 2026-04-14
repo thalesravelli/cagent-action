@@ -32,7 +32,30 @@ export async function generateAppToken(): Promise<void> {
     }
 
     const auth = createAppAuth({ appId, privateKey });
-    const { token } = await auth({ type: 'installation', installationId });
+    // GitHub excludes `workflows` from installation tokens by default, even
+    // when the App has that permission. Passing `permissions` explicitly fixes
+    // this, but also scopes the token DOWN to only what's listed — so we
+    // request every permission the App has to avoid accidentally dropping any.
+    //
+    // Keep this in sync with the App's settings:
+    // https://github.com/organizations/docker/settings/apps/<app>/permissions
+    const { token } = await auth({
+      type: 'installation',
+      installationId,
+      permissions: {
+        // Repository permissions
+        actions: 'write',
+        checks: 'write',
+        contents: 'write',
+        issues: 'write',
+        pull_requests: 'write',
+        statuses: 'write',
+        variables: 'read',
+        workflows: 'write',
+        // Organization permissions
+        members: 'read',
+      },
+    });
 
     core.setSecret(token);
     core.exportVariable('GITHUB_APP_TOKEN', token);
