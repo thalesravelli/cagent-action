@@ -8,6 +8,12 @@ Convert each CONFIRMED/LIKELY finding to an inline comment object for the `comme
 IMPORTANT: Use `jq` to construct the JSON payload. Do NOT manually build JSON strings
 with `echo` — this causes double-escaping of newlines (`\n` rendered as literal text).
 
+# WARNING: NEVER use `--arg body "$variable"` to pass comment body text to jq.
+# If the body contains `"`, backticks, or `$`, bash silently empties the variable,
+# producing a blank comment on the PR. Always write the body to a temp file via a
+# quoted heredoc (`<< 'EOF'`) and read it with `jq --rawfile`. A quoted heredoc
+# delimiter disables ALL shell expansion — backticks, `$`, and `"` are written verbatim.
+
 Build the review body and comments, then use `jq` to produce correctly-escaped JSON:
 ```bash
 # Review body is just the assessment badge — findings go in inline comments
@@ -16,12 +22,27 @@ REVIEW_BODY="### Assessment: 🟢 APPROVE"   # or 🟡 NEEDS ATTENTION / 🔴 CR
 # Start with an empty comments array
 echo '[]' > /tmp/review_comments.json
 
-# Append each finding (loop over your confirmed/likely results)
+# Append each finding using a quoted heredoc + jq --rawfile (safe for any body text)
+# NEVER use --arg body "$comment_body" — shell quoting breaks on ", backticks, and $
+
+cat > /tmp/comment_body.md << 'COMMENT_BODY_EOF'
+**[SEVERITY] One-line issue summary**
+
+Detailed explanation of the bug, trigger path, and impact.
+
+<!-- cagent-review -->
+COMMENT_BODY_EOF
+
 jq --arg path "$file_path" --argjson line "$line_number" \
-  --arg body "$comment_body" \
+  --rawfile body /tmp/comment_body.md \
   '. += [{path: $path, line: $line, body: $body}]' \
   /tmp/review_comments.json > /tmp/review_comments.tmp \
   && mv /tmp/review_comments.tmp /tmp/review_comments.json
+
+# Defensive: remove any comments with empty bodies before posting
+jq '[.[] | select(.body | length > 0)]' /tmp/review_comments.json > /tmp/review_comments.tmp \
+  && mv /tmp/review_comments.tmp /tmp/review_comments.json
+echo "Posting review with $(jq length /tmp/review_comments.json) inline comment(s)"
 
 # Use jq to assemble the final payload with proper escaping
 jq -n \

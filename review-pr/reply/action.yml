@@ -99,18 +99,3 @@ runs:
       with:
         path: ${{ github.workspace }}/.cache/pr-review-memory.db
         key: pr-review-memory-${{ github.repository }}-reply-${{ github.run_id }}
-
-    # Add a "confused" reaction to the triggering comment if the agent failed,
-    # so the developer knows their reply wasn't processed.
-    - name: React on failure
-      if: always() && steps.run-reply.outcome == 'failure' && inputs.comment-id != ''
-      continue-on-error: true
-      shell: bash
-      env:
-        GH_TOKEN: ${{ inputs.github-token }}
-        REPO: ${{ github.repository }}
-        COMMENT_ID: ${{ inputs.comment-id }}
-      run: |
-        gh api "repos/$REPO/pulls/comments/$COMMENT_ID/reactions" \
-          -f content="confused" --silent || true
-        echo "😕 Added reaction to indicate reply failed"

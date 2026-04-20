@@ -1,26 +1,3 @@
-# Reusable workflow for AI-powered PR reviews
-#
-# Usage:
-#   name: PR Review
-#   on:
-#     issue_comment: # Enables /review command in PR comments
-#       types: [created]
-#     pull_request_review_comment: # Captures feedback on review comments for learning
-#       types: [created]
-#     pull_request: # Triggers auto-review on PR open (same-repo branches only; fork PRs use /review)
-#       types: [ready_for_review, opened]
-#
-#   jobs:
-#     review:
-#       uses: docker/cagent-action/.github/workflows/review-pr.yml@d98096f432f2aea5091c811852c4da804e60623a # v1.4.1
-#       # Scoped to the job so other jobs in this workflow aren't over-permissioned
-#       permissions:
-#         contents: read       # Read repository files and PR diffs
-#         pull-requests: write # Post review comments and approve/request changes
-#         issues: write        # Create security incident issues if secrets are detected in output
-#         checks: write        # (Optional) Show review progress as a check run on the PR
-#         id-token: write      # Required for OIDC authentication to AWS Secrets Manager
-
 name: PR Review
 
 on:
@@ -48,6 +25,11 @@ on:
         default: ""
       add-prompt-files:
         description: "Comma-separated list of files to append to the prompt (e.g., 'AGENTS.md,CLAUDE.md')"
+        required: false
+        type: string
+        default: ""
+      trigger-run-id:
+        description: "Workflow run ID from pr-review-trigger.yml — used to download the event context artifact. When set, resolve-context job downloads the artifact and routes to the appropriate job."
         required: false
         type: string
         default: ""
@@ -85,35 +67,68 @@ on:
     outputs:
       exit-code:
         description: "Exit code from the review"
-        value: ${{ jobs.auto-review.outputs.exit-code || jobs.manual-review.outputs.exit-code }}
+        value: ${{ jobs.review.outputs.exit-code }}
 
 permissions:
   contents: read
   pull-requests: write
   issues: write
   id-token: write
-  # checks: write is intentionally omitted — callers can grant it optionally
-  # for the "PR Review" check run on the PR. The check creation steps use
-  # continue-on-error so the review works fine without it.
+  actions: read
 
 jobs:
-  # ==========================================================================
-  # AUTOMATIC REVIEW FOR ORG MEMBERS
-  # Triggers when a PR is marked ready for review or opened (non-draft)
-  # Supports two trigger paths:
-  #   1. pull_request event (same-repo branches only — fork PRs lack secret access)
-  #   2. workflow_run event with inputs.pr-number set (fork PRs via workflow_run pattern)
-  # Only runs for members of the configured org.
-  # ==========================================================================
-  auto-review:
+  resolve-context:
+    if: inputs.trigger-run-id != ''
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+    outputs:
+      trigger-event: ${{ steps.read.outputs.event-name }}
+      pr-number: ${{ steps.read.outputs.pr-number }}
+      pr-head-sha: ${{ steps.read.outputs.pr-head-sha }}
+      comment-json: ${{ steps.read.outputs.comment-json }}
+    steps:
+      - name: Download trigger context
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: pr-review-context
+          path: /tmp/context
+          run-id: ${{ inputs.trigger-run-id }}
+          github-token: ${{ github.token }}
+
+      - name: Read context
+        id: read
+        shell: bash
+        run: |
+          # Validate required artifact files exist
+          if [ ! -f /tmp/context/event_name.txt ] || [ ! -f /tmp/context/pr_number.txt ]; then
+            echo "::error::Required artifact files missing (event_name.txt or pr_number.txt)"
+            exit 1
+          fi
+
+          echo "event-name=$(cat /tmp/context/event_name.txt)" >> $GITHUB_OUTPUT
+          echo "pr-number=$(cat /tmp/context/pr_number.txt)" >> $GITHUB_OUTPUT
+          if [ -f /tmp/context/pr_head_sha.txt ]; then
+            echo "pr-head-sha=$(cat /tmp/context/pr_head_sha.txt)" >> $GITHUB_OUTPUT
+          fi
+          if [ -f /tmp/context/comment.json ]; then
+            # Use heredoc output syntax — jq -c compacts JSON but comment bodies
+            # can still contain literal newlines that break single-line echo.
+            {
+              echo 'comment-json<<COMMENT_JSON_EOF'
+              jq -c '.' /tmp/context/comment.json
+              echo 'COMMENT_JSON_EOF'
+            } >> $GITHUB_OUTPUT
+          fi
+
+  review:
+    needs: [resolve-context]
     if: |
-      (
-        github.event_name == 'pull_request' &&
-        !github.event.pull_request.draft &&
-        github.event.pull_request.head.repo.full_name == github.event.pull_request.base.repo.full_name
-      ) || (
-        github.event_name == 'workflow_run' &&
-        inputs.pr-number != ''
+      always() && (
+        (github.event_name == 'issue_comment' && github.event.issue.pull_request) ||
+        github.event_name == 'pull_request' ||
+        inputs.pr-number != '' ||
+        (needs.resolve-context.result == 'success' && needs.resolve-context.outputs.trigger-event == 'pull_request')
       )
     runs-on: ubuntu-latest
     permissions:
@@ -121,77 +136,141 @@ jobs:
       pull-requests: write
       issues: write
       id-token: write
+      actions: read
     outputs:
       exit-code: ${{ steps.run-review.outputs.exit-code }}
 
     steps:
-      - name: Setup credentials
-        uses: docker/cagent-action/.github/actions/setup-credentials@d98096f432f2aea5091c811852c4da804e60623a # v1.4.1
-
-      - name: Get PR number
-        id: get-pr
+      - name: Resolve PR number
+        id: pr
         shell: bash
         env:
+          GH_TOKEN: ${{ github.token }}
+          TRIGGER_PR_NUMBER: ${{ needs.resolve-context.outputs.pr-number }}
           INPUT_PR_NUMBER: ${{ inputs.pr-number }}
+          EVENT_ISSUE_NUMBER: ${{ github.event.issue.number }}
           EVENT_PR_NUMBER: ${{ github.event.pull_request.number }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
-          echo "pr-number=${INPUT_PR_NUMBER:-$EVENT_PR_NUMBER}" >> $GITHUB_OUTPUT
+          # Priority: resolve-context output > input > pull_request event > issue_comment event
+          if [ -n "$TRIGGER_PR_NUMBER" ]; then
+            PR_NUMBER="$TRIGGER_PR_NUMBER"
+            echo "source=trigger" >> $GITHUB_OUTPUT
+          elif [ -n "$INPUT_PR_NUMBER" ]; then
+            PR_NUMBER="$INPUT_PR_NUMBER"
+            echo "source=input" >> $GITHUB_OUTPUT
+          elif [ "$EVENT_NAME" = "pull_request" ] && [ -n "$EVENT_PR_NUMBER" ]; then
+            PR_NUMBER="$EVENT_PR_NUMBER"
+            echo "source=event" >> $GITHUB_OUTPUT
+          else
+            PR_NUMBER="$EVENT_ISSUE_NUMBER"
+            echo "source=event" >> $GITHUB_OUTPUT
+          fi
+          # Validate PR number is a positive integer before downstream use
+          if ! [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
+            echo "::error::Invalid PR number: '$PR_NUMBER' (expected positive integer)"
+            exit 1
+          fi
+          echo "number=$PR_NUMBER" >> $GITHUB_OUTPUT
+          echo "Resolved PR #$PR_NUMBER"
 
-      # For workflow_run events, github.event.pull_request is unavailable — fetch PR author
-      # and draft status via API using github.token (repo read access).
-      # Skipped for pull_request events where the payload already has this info.
-      - name: Fetch PR info
-        id: pr-info
-        if: github.event_name == 'workflow_run'
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+      - name: Check for /review command
+        if: github.event_name == 'issue_comment'
+        id: command
+        shell: bash
         env:
-          PR_NUMBER: ${{ steps.get-pr.outputs.pr-number }}
-        with:
-          github-token: ${{ github.token }}
-          script: |
-            const { data: pr } = await github.rest.pulls.get({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              pull_number: parseInt(process.env.PR_NUMBER, 10)
-            });
-            core.setOutput('author', pr.user.login);
-            core.setOutput('draft', pr.draft ? 'true' : 'false');
+          ISSUE_PR: ${{ github.event.issue.pull_request }}
+          COMMENT_TYPE: ${{ github.event.comment.user.type }}
+          COMMENT_AUTHOR: ${{ github.event.comment.user.login }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          if [ -z "$ISSUE_PR" ]; then
+            echo "is_review=false" >> $GITHUB_OUTPUT
+            echo "⏭️ Not a PR issue comment, skipping"
+            exit 0
+          fi
 
-      - name: Check if PR author is org member
+          if [ "$COMMENT_TYPE" = "Bot" ] && [ "$COMMENT_AUTHOR" != "docker-agent[bot]" ]; then
+            echo "is_review=false" >> $GITHUB_OUTPUT
+            echo "⏭️ Bot user ($COMMENT_AUTHOR) is not trusted, skipping"
+            exit 0
+          fi
+
+          if [[ "$COMMENT_BODY" =~ ^/review ]]; then
+            echo "is_review=true" >> $GITHUB_OUTPUT
+          else
+            echo "is_review=false" >> $GITHUB_OUTPUT
+            echo "⏭️ Not a /review command, skipping"
+          fi
+
+      - name: Check if PR is draft
+        if: github.event_name != 'issue_comment'
+        id: draft
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          IS_DRAFT=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.draft')
+          if [ "$IS_DRAFT" = "true" ]; then
+            echo "skip=true" >> $GITHUB_OUTPUT
+            echo "⏭️ PR is draft, skipping auto-review"
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Setup credentials
+        if: |
+          steps.command.outputs.is_review != 'false' &&
+          steps.draft.outputs.skip != 'true'
+        uses: docker/cagent-action/.github/actions/setup-credentials@d98096f432f2aea5091c811852c4da804e60623a # v1.4.1
+
+      - name: Check if org member
         id: membership
+        if: |
+          steps.command.outputs.is_review != 'false' &&
+          steps.draft.outputs.skip != 'true'
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
-          PR_NUMBER: ${{ steps.get-pr.outputs.pr-number }}
-          PR_DRAFT: ${{ steps.pr-info.outputs.draft }}
-          PR_AUTHOR: ${{ steps.pr-info.outputs.author }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          PR_SOURCE: ${{ steps.pr.outputs.source }}
           ORG: docker
+          COMMENT_AUTHOR: ${{ github.event.comment.user.login }}
+          COMMENT_AUTHOR_TYPE: ${{ github.event.comment.user.type }}
         with:
           github-token: ${{ env.ORG_MEMBERSHIP_TOKEN }}
           script: |
             const org = process.env.ORG;
-            const draft = process.env.PR_DRAFT;
-            const prNumber = process.env.PR_NUMBER;
+            const source = process.env.PR_SOURCE;
 
             let username;
-            if (context.eventName === 'workflow_run') {
-              if (draft === 'true') {
-                core.setOutput('is_member', 'false');
-                console.log(`⏭️ PR #${prNumber} is a draft — skipping auto-review`);
+            if (source === 'event') {
+              const userType = process.env.COMMENT_AUTHOR_TYPE;
+              const login = process.env.COMMENT_AUTHOR;
+              if (userType === 'Bot') {
+                core.setOutput('is_member', 'true');
+                console.log(`✅ ${login} is a Bot — allowing /review command`);
                 return;
               }
-              username = process.env.PR_AUTHOR;
+              username = login;
             } else {
-              username = context.payload.pull_request.user.login;
+              const { data: pr } = await github.rest.pulls.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: parseInt(process.env.PR_NUMBER, 10)
+              });
+              username = pr.user.login;
             }
 
             try {
               await github.rest.orgs.checkMembershipForUser({ org, username });
               core.setOutput('is_member', 'true');
-              console.log(`✅ ${username} is a ${org} org member — proceeding with auto-review`);
+              console.log(`✅ ${username} is a ${org} org member — proceeding with review`);
             } catch (error) {
               if (error.status === 404 || error.status === 302) {
                 core.setOutput('is_member', 'false');
-                console.log(`⏭️ ${username} is not a ${org} org member - skipping auto-review`);
+                console.log(`⏭️ ${username} is not a ${org} org member — skipping review`);
               } else if (error.status === 401) {
                 core.setFailed(
                   `❌ Org membership token is missing or invalid (HTTP 401).\n\n` +
@@ -203,106 +282,15 @@ jobs:
               }
             }
 
-      - name: Checkout PR head
-        if: steps.membership.outputs.is_member == 'true'
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          fetch-depth: 0
-          ref: refs/pull/${{ steps.get-pr.outputs.pr-number }}/head
-
-      - name: Run PR Review
-        if: steps.membership.outputs.is_member == 'true'
-        id: run-review
-        continue-on-error: true # Don't fail the calling workflow if the review errors
-        uses: docker/cagent-action/review-pr@d98096f432f2aea5091c811852c4da804e60623a # v1.4.1
-        with:
-          pr-number: ${{ steps.get-pr.outputs.pr-number }}
-          additional-prompt: ${{ inputs.additional-prompt }}
-          add-prompt-files: ${{ inputs.add-prompt-files }}
-          model: ${{ inputs.model }}
-          github-token: ${{ env.GITHUB_APP_TOKEN || github.token }}
-          anthropic-api-key: ${{ env.ANTHROPIC_API_KEY_FROM_SSM || secrets.ANTHROPIC_API_KEY }}
-          openai-api-key: ${{ env.OPENAI_API_KEY_FROM_SSM || secrets.OPENAI_API_KEY }}
-          google-api-key: ${{ secrets.GOOGLE_API_KEY }}
-          aws-bearer-token-bedrock: ${{ secrets.AWS_BEARER_TOKEN_BEDROCK }}
-          xai-api-key: ${{ secrets.XAI_API_KEY }}
-          nebius-api-key: ${{ secrets.NEBIUS_API_KEY }}
-          mistral-api-key: ${{ secrets.MISTRAL_API_KEY }}
-          skip-auth: "true" # Org membership already verified above
-
-  # ==========================================================================
-  # MANUAL REVIEW PIPELINE
-  # Triggers when someone comments /review on a PR
-  # ==========================================================================
-  manual-review:
-    if: |
-      github.event.issue.pull_request &&
-      startsWith(github.event.comment.body, '/review') &&
-      (github.event.comment.user.type != 'Bot' || github.event.comment.user.login == 'docker-agent[bot]')
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pull-requests: write
-      issues: write
-      id-token: write
-    outputs:
-      exit-code: ${{ steps.run-review.outputs.exit-code }}
-
-    steps:
-
-      - name: Setup credentials
-        uses: docker/cagent-action/.github/actions/setup-credentials@d98096f432f2aea5091c811852c4da804e60623a # v1.4.1
-
-      - name: Check if commenter is org member
-        id: membership
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
-        env:
-          ORG: docker
-          USERNAME: ${{ github.event.comment.user.login }}
-          USER_TYPE: ${{ github.event.comment.user.type }}
-        with:
-          github-token: ${{ env.ORG_MEMBERSHIP_TOKEN }}
-          script: |
-            const org = process.env.ORG;
-            const username = process.env.USERNAME;
-            const userType = process.env.USER_TYPE;
-
-            // Allow trusted bot to bypass org membership check
-            if (userType === 'Bot') {
-              core.setOutput('is_member', 'true');
-              console.log(`✅ ${username} is a Bot — allowing /review command`);
-              return;
-            }
-
-            try {
-              await github.rest.orgs.checkMembershipForUser({ org, username });
-              core.setOutput('is_member', 'true');
-              console.log(`✅ ${username} is a ${org} org member — proceeding with manual review`);
-            } catch (error) {
-              if (error.status === 404 || error.status === 302) {
-                core.setOutput('is_member', 'false');
-                console.log(`⏭️ ${username} is not a ${org} org member — skipping manual review`);
-              } else if (error.status === 401) {
-                core.warning(
-                  `❌ Org membership token is missing or invalid (HTTP 401).\n\n` +
-                  `This token is fetched automatically from AWS Secrets Manager in docker/* repos.\n` +
-                  `Ensure the workflow job has 'id-token: write' permission and OIDC is configured.`
-                );
-                core.setOutput('is_member', 'false');
-              } else {
-                core.warning(`Failed to check org membership: ${error.message}`);
-                core.setOutput('is_member', 'false');
-              }
-            }
-
-      # (prevents GitHub from nesting it under unrelated pull_request-triggered workflows)
       - name: Create check run
-        if: steps.membership.outputs.is_member == 'true'
+        if: |
+          steps.pr.outputs.source == 'event' &&
+          steps.membership.outputs.is_member == 'true'
         id: create-check
-        continue-on-error: true # Don't fail if caller didn't grant checks: write
+        continue-on-error: true
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
-          PR_NUMBER: ${{ inputs.pr-number || github.event.issue.number }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
         with:
           github-token: ${{ env.GITHUB_APP_TOKEN || github.token }}
           script: |
@@ -325,19 +313,25 @@ jobs:
             core.setOutput('check-id', check.id);
 
       - name: Checkout PR head
-        if: steps.membership.outputs.is_member == 'true'
+        if: |
+          steps.membership.outputs.is_member == 'true' &&
+          steps.command.outputs.is_review != 'false' &&
+          steps.draft.outputs.skip != 'true'
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
-          ref: refs/pull/${{ github.event.issue.number }}/head
+          ref: refs/pull/${{ steps.pr.outputs.number }}/head
 
       - name: Run PR Review
-        if: steps.membership.outputs.is_member == 'true'
+        if: |
+          steps.membership.outputs.is_member == 'true' &&
+          steps.command.outputs.is_review != 'false' &&
+          steps.draft.outputs.skip != 'true'
         id: run-review
-        continue-on-error: true # Don't fail the calling workflow if the review errors
+        continue-on-error: true
         uses: docker/cagent-action/review-pr@d98096f432f2aea5091c811852c4da804e60623a # v1.4.1
         with:
-          pr-number: ${{ inputs.pr-number || github.event.issue.number }}
+          pr-number: ${{ steps.pr.outputs.number }}
           comment-id: ${{ inputs.comment-id || github.event.comment.id }}
           additional-prompt: ${{ inputs.additional-prompt }}
           add-prompt-files: ${{ inputs.add-prompt-files }}
@@ -351,7 +345,7 @@ jobs:
           xai-api-key: ${{ secrets.XAI_API_KEY }}
           nebius-api-key: ${{ secrets.NEBIUS_API_KEY }}
           mistral-api-key: ${{ secrets.MISTRAL_API_KEY }}
-          skip-auth: "true" # Org membership already verified above
+          skip-auth: "true"
 
       - name: Update check run
         if: always() && steps.create-check.outputs.check-id != ''
@@ -376,70 +370,11 @@ jobs:
               core.warning(`Failed to update check run: ${error.message}`);
             }
 
-  # ==========================================================================
-  # CAPTURE FEEDBACK
-  # Saves feedback data as an artifact for lazy processing. This job
-  # intentionally avoids using secrets. The actual AI processing happens
-  # during the next review run, which has full secret access via issue_comment.
-  # ==========================================================================
-  capture-feedback:
-    if: github.event_name == 'pull_request_review_comment' && github.event.comment.in_reply_to_id
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Check if reply is to agent comment
-        id: check
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PARENT_ID: ${{ github.event.comment.in_reply_to_id }}
-          REPO: ${{ github.repository }}
-        run: |
-          if [ -z "$PARENT_ID" ]; then
-            echo "is_agent=false" >> $GITHUB_OUTPUT
-            echo "⏭️ Not a reply comment, skipping"
-            exit 0
-          fi
-
-          parent=$(gh api repos/$REPO/pulls/comments/$PARENT_ID 2>/dev/null || echo "{}")
-          if echo "$parent" | jq -r '.body // ""' | grep -q "<!-- cagent-review -->"; then
-            echo "is_agent=true" >> $GITHUB_OUTPUT
-            echo "✅ Reply is to an agent review comment"
-          else
-            echo "is_agent=false" >> $GITHUB_OUTPUT
-            echo "⏭️ Not a reply to agent comment, skipping"
-          fi
-
-      - name: Save feedback data
-        if: steps.check.outputs.is_agent == 'true'
-        shell: bash
-        env:
-          COMMENT_JSON: ${{ toJSON(github.event.comment) }}
-        run: |
-          mkdir -p feedback
-          echo "$COMMENT_JSON" > feedback/feedback.json
-          echo "📦 Saved feedback data for async processing"
-
-      - name: Upload feedback artifact
-        if: steps.check.outputs.is_agent == 'true'
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
-        with:
-          name: pr-review-feedback
-          path: feedback/
-          retention-days: 90
-
-  # ==========================================================================
-  # REPLY TO FEEDBACK
-  # Responds directly in the PR review thread when a user replies to an agent
-  # comment. Runs in parallel with capture-feedback — this job handles the
-  # synchronous conversational reply, while capture-feedback saves the artifact
-  # for async learning on the next review run (resilient fallback).
-  # ==========================================================================
   reply-to-feedback:
+    needs: [resolve-context]
     if: |
-      github.event_name == 'pull_request_review_comment' &&
-      github.event.comment.in_reply_to_id &&
-      github.event.comment.user.type != 'Bot'
+      (github.event_name == 'pull_request_review_comment' && github.event.comment.in_reply_to_id) ||
+      (needs.resolve-context.result == 'success' && needs.resolve-context.outputs.trigger-event == 'pull_request_review_comment')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -449,15 +384,60 @@ jobs:
 
     steps:
 
-      - name: Setup credentials
-        uses: docker/cagent-action/.github/actions/setup-credentials@d98096f432f2aea5091c811852c4da804e60623a # v1.4.1
+      - name: Parse comment context
+        id: feedback
+        shell: bash
+        env:
+          # Trigger path (workflow_run → resolve-context)
+          COMMENT_JSON: ${{ needs.resolve-context.outputs.comment-json }}
+          CTX_PR_NUMBER: ${{ needs.resolve-context.outputs.pr-number }}
+          CTX_PR_HEAD_SHA: ${{ needs.resolve-context.outputs.pr-head-sha }}
+          # Direct path (same-repo pull_request_review_comment)
+          EVENT_COMMENT_BODY: ${{ github.event.comment.body }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [ -n "$COMMENT_JSON" ]; then
+            # Trigger path: comment data from resolve-context artifact
+            printf '%s' "$COMMENT_JSON" > /tmp/reply_comment.json
+            echo "pr-number=$CTX_PR_NUMBER" >> $GITHUB_OUTPUT
+            echo "pr-head-sha=$CTX_PR_HEAD_SHA" >> $GITHUB_OUTPUT
+          elif [ "$EVENT_NAME" = "pull_request_review_comment" ]; then
+            # Direct path: comment data from event payload
+            echo '${{ toJSON(github.event.comment) }}' > /tmp/reply_comment.json
+            echo "pr-number=${{ github.event.pull_request.number }}" >> $GITHUB_OUTPUT
+            echo "pr-head-sha=${{ github.event.pull_request.head.sha }}" >> $GITHUB_OUTPUT
+          else
+            echo "::error::No comment data available"
+            exit 1
+          fi
+
+          echo "comment-id=$(jq -r '.id' /tmp/reply_comment.json)" >> $GITHUB_OUTPUT
+          echo "comment-author=$(jq -r '.user.login' /tmp/reply_comment.json)" >> $GITHUB_OUTPUT
+          echo "comment-author-type=$(jq -r '.user.type' /tmp/reply_comment.json)" >> $GITHUB_OUTPUT
+          # Use // empty so null in_reply_to_id becomes empty string (not the literal "null")
+          echo "parent-id=$(jq -r '.in_reply_to_id // empty' /tmp/reply_comment.json)" >> $GITHUB_OUTPUT
+          jq -r '.body' /tmp/reply_comment.json > /tmp/comment_body.txt
+
+      - name: Check bot guard
+        id: bot-guard
+        shell: bash
+        run: |
+          AUTHOR_TYPE="${{ steps.feedback.outputs.comment-author-type }}"
+          AUTHOR="${{ steps.feedback.outputs.comment-author }}"
+          if [ "$AUTHOR_TYPE" = "Bot" ]; then
+            echo "⏭️ Skipping reply to bot comment from $AUTHOR (prevents cascade)"
+            echo "is_bot=true" >> $GITHUB_OUTPUT
+          else
+            echo "is_bot=false" >> $GITHUB_OUTPUT
+          fi
 
       - name: Check if reply is to agent comment
+        if: steps.bot-guard.outputs.is_bot != 'true'
         id: check
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          PARENT_ID: ${{ github.event.comment.in_reply_to_id }}
+          PARENT_ID: ${{ steps.feedback.outputs.parent-id }}
           REPO: ${{ github.repository }}
         run: |
           if [ -z "$PARENT_ID" ]; then
@@ -514,6 +494,10 @@ jobs:
             exit 1
           fi
 
+      - name: Setup credentials
+        if: steps.bot-guard.outputs.is_bot != 'true' && steps.check.outputs.is_agent == 'true'
+        uses: docker/cagent-action/.github/actions/setup-credentials@d98096f432f2aea5091c811852c4da804e60623a # v1.4.1
+
       - name: Check authorization
         if: steps.check.outputs.is_agent == 'true'
         id: auth
@@ -521,7 +505,7 @@ jobs:
         env:
           GH_TOKEN: ${{ env.ORG_MEMBERSHIP_TOKEN }}
           ORG: docker
-          USERNAME: ${{ github.event.comment.user.login }}
+          USERNAME: ${{ steps.feedback.outputs.comment-author }}
         run: |
           if [ -z "$GH_TOKEN" ]; then
             echo "::error::ORG_MEMBERSHIP_TOKEN is not set — org membership check cannot run (ensure id-token: write permission is configured)"
@@ -562,11 +546,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_NUMBER: ${{ steps.feedback.outputs.pr-number }}
           ROOT_COMMENT_ID: ${{ steps.check.outputs.root_comment_id }}
-          AUTHOR: ${{ github.event.comment.user.login }}
+          AUTHOR: ${{ steps.feedback.outputs.comment-author }}
         run: |
-          
+
           jq -n \
             --arg body "Sorry @$AUTHOR, conversational replies are currently available to repository collaborators only. Your feedback has still been captured and will be used to improve future reviews.
 
@@ -582,15 +566,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           ROOT_ID: ${{ steps.check.outputs.root_comment_id }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_NUMBER: ${{ steps.feedback.outputs.pr-number }}
           REPO: ${{ github.repository }}
           FILE_PATH: ${{ steps.check.outputs.file_path }}
           LINE: ${{ steps.check.outputs.line }}
-          # The triggering comment from the webhook payload — guaranteed fresh,
-          # unlike the API which may have eventual consistency lag.
-          TRIGGER_COMMENT_BODY: ${{ github.event.comment.body }}
-          TRIGGER_COMMENT_AUTHOR: ${{ github.event.comment.user.login }}
-          TRIGGER_COMMENT_ID: ${{ github.event.comment.id }}
+          TRIGGER_COMMENT_AUTHOR: ${{ steps.feedback.outputs.comment-author }}
+          TRIGGER_COMMENT_ID: ${{ steps.feedback.outputs.comment-id }}
         run: |
           # Fetch the root comment (fail early if the API call errors)
           root=$(gh api "repos/$REPO/pulls/comments/$ROOT_ID") || {
@@ -603,7 +584,7 @@ jobs:
           # Uses --paginate to handle PRs with >100 review comments.
           # Each page is processed by jq independently, then merged with jq -s.
           # Note: the triggering comment may not appear here due to eventual
-          # consistency, so we append it from the webhook payload below.
+          # consistency, so we append it from /tmp/comment_body.txt below.
           all_comments=$(gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/comments" | \
             jq -s --arg root_id "$ROOT_ID" \
             '[.[][] | select((.in_reply_to_id | tostring) == $root_id)] | sort_by(.created_at)') || {
@@ -638,7 +619,7 @@ jobs:
             if [ "$reply_count" -gt 0 ]; then
               for i in $(seq 0 $((reply_count - 1))); do
                 comment_id=$(echo "$all_comments" | jq -r ".[$i].id") || continue
-                # Skip the triggering comment — we append it from the payload below
+                # Skip the triggering comment — we append it from /tmp/comment_body.txt below
                 if [ "$comment_id" = "$TRIGGER_COMMENT_ID" ]; then
                   continue
                 fi
@@ -655,23 +636,22 @@ jobs:
               done
             fi
 
-            # Always append the triggering comment last — sourced directly from
-            # the webhook payload so it's guaranteed to be present.
+            # Always append the triggering comment last — sourced from /tmp/comment_body.txt
+            # (written by the Parse comment context step; safe for multi-line bodies).
             echo "[REPLY by @$TRIGGER_COMMENT_AUTHOR] ← this is the reply you are responding to"
-            echo "$TRIGGER_COMMENT_BODY"
+            cat /tmp/comment_body.txt
             echo ""
             echo "$DELIM"
           } >> $GITHUB_OUTPUT
 
-          echo "✅ Built thread context with replies (triggering comment from webhook payload)"
+          echo "✅ Built thread context with replies (triggering comment from /tmp/comment_body.txt)"
 
-      # Safe to checkout PR head because the reply agent only READS files (no code execution)
       - name: Checkout PR head
         if: steps.check.outputs.is_agent == 'true' && steps.auth.outputs.authorized == 'true'
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
-          ref: refs/pull/${{ github.event.pull_request.number }}/head
+          ref: refs/pull/${{ steps.feedback.outputs.pr-number }}/head
 
       - name: Run reply
         if: steps.check.outputs.is_agent == 'true' && steps.auth.outputs.authorized == 'true'
@@ -679,7 +659,7 @@ jobs:
         uses: docker/cagent-action/review-pr/reply@d98096f432f2aea5091c811852c4da804e60623a # v1.4.1
         with:
           thread-context: ${{ steps.thread.outputs.prompt }}
-          comment-id: ${{ github.event.comment.id }}
+          comment-id: ${{ steps.feedback.outputs.comment-id }}
           anthropic-api-key: ${{ env.ANTHROPIC_API_KEY_FROM_SSM || secrets.ANTHROPIC_API_KEY }}
           openai-api-key: ${{ env.OPENAI_API_KEY_FROM_SSM || secrets.OPENAI_API_KEY }}
           google-api-key: ${{ secrets.GOOGLE_API_KEY }}
@@ -689,3 +669,30 @@ jobs:
           mistral-api-key: ${{ secrets.MISTRAL_API_KEY }}
           github-token: ${{ env.GITHUB_APP_TOKEN || github.token }}
           skip-auth: "true" # Org membership already verified above
+
+      - name: Save feedback artifact
+        if: steps.check.outputs.is_agent == 'true'
+        shell: bash
+        run: |
+          # /tmp/reply_comment.json was written by the "Parse comment context" step
+          if [ ! -f /tmp/reply_comment.json ]; then
+            echo "::warning::No comment JSON available, skipping feedback capture"
+            exit 0
+          fi
+          mkdir -p feedback
+          cp /tmp/reply_comment.json feedback/feedback.json
+          # Validate it's parseable JSON before uploading
+          if ! jq empty feedback/feedback.json 2>/dev/null; then
+            echo "::warning::Feedback JSON is malformed, skipping"
+            rm -rf feedback
+            exit 0
+          fi
+          echo "📦 Saved feedback data for async processing"
+
+      - name: Upload feedback artifact
+        if: steps.check.outputs.is_agent == 'true' && hashFiles('feedback/feedback.json') != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pr-review-feedback
+          path: feedback/
+          retention-days: 90

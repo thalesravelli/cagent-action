@@ -4,55 +4,146 @@ AI-powered pull request review using a multi-agent system. Analyzes code changes
 
 ## Quick Start
 
-### 1. Create the workflow
+### Same-repo PRs (1 workflow)
 
-Add `.github/workflows/pr-review.yml` to your repo with this **minimal but safe setup**:
+If your repo only accepts PRs from branches within the same repo (no forks), you need a single workflow file:
+
+**`.github/workflows/pr-review.yml`**:
 
 ```yaml
 name: PR Review
 on:
-  issue_comment: # Enables /review command in PR comments
-    types: [created]
-  pull_request_review_comment: # Captures feedback on review comments for learning
-    types: [created]
-  pull_request: # Triggers auto-review on PR open (same-repo branches only; fork PRs use /review)
+  pull_request:
     types: [ready_for_review, opened]
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
 
 permissions:
-  contents: read # Required at top-level to give `issue_comment` events access to the secrets below.
+  contents: read
 
 jobs:
   review:
     uses: docker/cagent-action/.github/workflows/review-pr.yml@VERSION
-    # Scoped to the job so other jobs in this workflow aren't over-permissioned
     permissions:
       contents: read # Read repository files and PR diffs
-      pull-requests: write # Post review comments and approve/request changes
-      issues: write # Create security incident issues if secrets are detected in output
-      checks: write # (Optional) Show review progress as a check run on the PR
+      pull-requests: write # Post review comments
+      issues: write # Create security incident issues if secrets detected
+      checks: write # (Optional) Show review progress as a check run
       id-token: write # Required for OIDC authentication to AWS Secrets Manager
 ```
 
-> **Note:** Auto-review on `pull_request` events only works for same-repo branches — fork PRs are skipped because OIDC tokens aren't available in the fork context. For fork PRs, an org member can comment `/review` to trigger a review (the `issue_comment` event runs in the base repo context where OIDC works). See [Fork PR Auto-Review](#fork-pr-auto-review) for a two-workflow pattern that enables automatic reviews on fork PRs.
+That's it. All three events (`pull_request`, `issue_comment`, `pull_request_review_comment`) have full OIDC/secret access for same-repo PRs, so the reusable workflow handles everything directly.
 
-> **Why explicit secrets instead of `secrets: inherit`?** This follows the principle of least privilege — the called workflow only receives the secrets it actually needs, not every secret in your repository. This is the recommended approach for public repos and security-conscious teams.
+### Repos that accept fork PRs (2 workflows)
 
-### Customizing for your organization
+Fork PRs are subject to GitHub's security restrictions: `pull_request` and `pull_request_review_comment` events get **read-only tokens, no secrets, and no OIDC**. To work around this, you need a second "trigger" workflow that saves event context as an artifact, then a `workflow_run` handler picks it up with full permissions.
+
+**`.github/workflows/pr-review-trigger.yml`** — lightweight, no secrets needed:
+
+```yaml
+name: PR Review - Trigger
+on:
+  pull_request:
+    types: [ready_for_review, opened]
+  pull_request_review_comment:
+    types: [created]
+
+permissions: {}
+
+jobs:
+  save-context:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Save event context
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          COMMENT_JSON: ${{ toJSON(github.event.comment) }}
+        run: |
+          mkdir -p context
+          printf '%s' "${{ github.event_name }}" > context/event_name.txt
+          printf '%s' "$PR_NUMBER" > context/pr_number.txt
+          printf '%s' "$PR_HEAD_SHA" > context/pr_head_sha.txt
+          if [ "${{ github.event_name }}" = "pull_request_review_comment" ]; then
+            printf '%s' "$COMMENT_JSON" > context/comment.json
+          fi
+
+      - name: Upload context
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pr-review-context
+          path: context/
+          retention-days: 1
+```
+
+**`.github/workflows/pr-review.yml`** — calls the reusable review workflow:
+
+```yaml
+name: PR Review
+on:
+  issue_comment:
+    types: [created]
+  workflow_run:
+    workflows: ["PR Review - Trigger"]
+    types: [completed]
+
+permissions:
+  contents: read
+
+jobs:
+  review:
+    if: |
+      github.event_name == 'issue_comment' ||
+      github.event.workflow_run.conclusion == 'success'
+    uses: docker/cagent-action/.github/workflows/review-pr.yml@VERSION
+    permissions:
+      contents: read # Read repository files and PR diffs
+      pull-requests: write # Post review comments
+      issues: write # Create security incident issues if secrets detected
+      checks: write # (Optional) Show review progress as a check run
+      id-token: write # Required for OIDC authentication to AWS Secrets Manager
+      actions: read # Download artifacts from trigger workflow
+    with:
+      trigger-run-id: ${{ github.event_name == 'workflow_run' && format('{0}', github.event.workflow_run.id) || '' }}
+```
+
+#### How the two workflows interact
+
+```
+pull_request / pull_request_review_comment
+  → pr-review-trigger.yml (saves context as artifact, no secrets needed)
+  → completes
+  → workflow_run fires
+  → pr-review.yml (downloads artifact, routes to review or reply)
+
+/review comment
+  → pr-review.yml directly (issue_comment has full permissions)
+```
+
+The `issue_comment` event (`/review` command) always has full permissions regardless of fork status, so it works directly without the trigger workflow.
+
+### Customizing
 
 ```yaml
 with:
   model: anthropic/claude-haiku-4-5 # Use a faster/cheaper model
 ```
 
-### 2. That's it!
+### What you get
 
-The workflow automatically handles:
+| Trigger                 | Behavior                                                           |
+| ----------------------- | ------------------------------------------------------------------ |
+| PR opened/ready         | Auto-reviews the PR                                                |
+| `/review` comment       | Manual review (shows as a check run if `checks: write` is granted) |
+| Reply to review comment | Responds in-thread and captures feedback to improve future reviews |
 
-| Trigger                 | Behavior                                                                                 |
-| ----------------------- | ---------------------------------------------------------------------------------------- |
-| PR opened/ready         | Auto-reviews PRs from your org members (same-repo branches only; fork PRs use `/review`) |
-| `/review` comment       | Manual review on any PR (shows as a check run on the PR if `checks: write` is granted)   |
-| Reply to review comment | Responds in-thread and learns from feedback to improve future reviews                    |
+> **Built-in defense-in-depth:**
+>
+> 1. **Verifies org membership** before every review (auto-review checks the PR author; `/review` checks the commenter)
+> 2. **Prevents bot cascades** — replies from bots (except `docker-agent[bot]`) are ignored
+> 3. **Fork PRs work automatically** with the two-workflow setup — the trigger → `workflow_run` pattern provides OIDC/secret access regardless of fork status
 
 ---
 
@@ -90,154 +181,20 @@ docker agent run agentcatalog/review-pr --prompt-file CONTRIBUTING.md "Review my
 
 ---
 
-## Required Secrets
-
-### Secrets
-
-Provide at least one AI API key as a repository secret:
-
-| Secret              | Description                         |
-| ------------------- | ----------------------------------- |
-| `ANTHROPIC_API_KEY` | Anthropic API key for Claude models |
-| `OPENAI_API_KEY`    | OpenAI API key                      |
-| `GOOGLE_API_KEY`    | Google API key (Gemini)             |
-
----
-
-## Advanced: Using the Composite Action Directly
-
-For more control over the workflow, use the composite action instead of the reusable workflow:
-
-```yaml
-name: PR Review
-
-on:
-  issue_comment:
-    types: [created]
-
-permissions:
-  contents: read # Read repository files and PR diffs
-  pull-requests: write # Post review comments and approve/request changes
-  issues: write # Create security incident issues if secrets are detected in output
-  checks: write # (Optional) Show review progress as a check run on the PR
-  id-token: write # Required for OIDC authentication to AWS Secrets Manager
-
-jobs:
-  review:
-    if: github.event.issue.pull_request && startsWith(github.event.comment.body, '/review')
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          ref: refs/pull/${{ github.event.issue.number }}/head
-
-      - uses: docker/cagent-action/review-pr@VERSION
-        with:
-          anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-```
-
-> **Note:** When using the composite action directly, learning from feedback is handled automatically — the review action collects and processes any pending feedback artifacts before each review. However, to _capture_ that feedback, use the reusable workflow which includes the `capture-feedback` job, or add the equivalent artifact upload step to your own workflow.
-
----
-
-## Adding Project-Specific Guidelines
-
-The recommended approach is to add an `AGENTS.md` file to your repository root. The reviewer automatically reads it before every review — no workflow changes needed. This is ideal for project conventions, language versions, and coding standards that should always apply.
-
-For workflow-level overrides or guidelines that apply across multiple repos, use the `additional-prompt` input:
-
-```yaml
-- uses: docker/cagent-action/review-pr@VERSION
-  with:
-    anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
-    additional-prompt: |
-      ## Go Patterns
-      - Flag missing `if err != nil` error handling
-      - Check for `interface{}` without type assertions
-      - Verify context.Context is passed through calls
-```
-
-```yaml
-- uses: docker/cagent-action/review-pr@VERSION
-  with:
-    anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
-    additional-prompt: |
-      ## TypeScript Patterns
-      - Flag any use of `any` type
-      - Check for missing null/undefined checks
-      - Verify async functions have try/catch
-```
-
-```yaml
-# Project-specific conventions
-- uses: docker/cagent-action/review-pr@VERSION
-  with:
-    anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
-    additional-prompt: |
-      ## Project Conventions
-      - We use `zod` for validation - flag manual type checks
-      - Database queries must use the `db.transaction()` wrapper
-      - All API handlers should use `withErrorHandling()` HOF
-      - Prefer `date-fns` over native Date methods
-```
-
----
-
-## Using a Different Model
-
-The default model is **Claude Sonnet 4.5** (`anthropic/claude-sonnet-4-5`), which balances quality and cost.
-
-Override for more thorough or cost-effective reviews:
-
-```yaml
-# Anthropic (default provider)
-- uses: docker/cagent-action/review-pr@VERSION
-  with:
-    anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
-    model: anthropic/claude-opus-4 # More thorough reviews
-```
-
-```yaml
-# OpenAI Codex
-- uses: docker/cagent-action/review-pr@VERSION
-  with:
-    openai-api-key: ${{ secrets.OPENAI_API_KEY }}
-    model: openai/codex-mini
-```
-
-```yaml
-# Google Gemini
-- uses: docker/cagent-action/review-pr@VERSION
-  with:
-    google-api-key: ${{ secrets.GOOGLE_API_KEY }}
-    model: gemini/gemini-2.0-flash
-```
-
-```yaml
-# xAI Grok
-- uses: docker/cagent-action/review-pr@VERSION
-  with:
-    xai-api-key: ${{ secrets.XAI_API_KEY }}
-    model: xai/grok-2
-```
-
----
-
 ## Inputs
 
 ### Reusable Workflow
 
 When using `docker/cagent-action/.github/workflows/review-pr.yml`:
 
-| Input               | Description                                         | Default |
-| ------------------- | --------------------------------------------------- | ------- |
-| `pr-number`         | PR number (auto-detected from event)                | -       |
-| `comment-id`        | Comment ID for reactions (auto-detected)            | -       |
-| `additional-prompt` | Additional review guidelines                        | -       |
-| `model`             | Model override (e.g., `anthropic/claude-haiku-4-5`) | -       |
-| `add-prompt-files`  | Comma-separated files to append to the prompt       | -       |
+| Input               | Description                                                            | Default |
+| ------------------- | ---------------------------------------------------------------------- | ------- |
+| `trigger-run-id`    | Workflow run ID from `pr-review-trigger.yml` (for `workflow_run` path) | -       |
+| `pr-number`         | PR number override (auto-detected from event or trigger artifact)      | -       |
+| `comment-id`        | Comment ID for reactions (auto-detected)                               | -       |
+| `additional-prompt` | Additional review guidelines                                           | -       |
+| `model`             | Model override (e.g., `anthropic/claude-haiku-4-5`)                    | -       |
+| `add-prompt-files`  | Comma-separated files to append to the prompt                          | -       |
 
 ### `review-pr` (Composite Action)
 
@@ -263,24 +220,7 @@ PR number and comment ID are auto-detected from `github.event` when not provided
 | `github-app-private-key`   | GitHub App private key                                           | No       |
 | `add-prompt-files`         | Comma-separated files to append to the prompt                    | No       |
 
-\*At least one API key is required.
-
----
-
-## Cost
-
-The action uses **Claude Sonnet 4.5** by default. Typical costs per review:
-
-| PR Size             | Estimated Cost |
-| ------------------- | -------------- |
-| Small (1-5 files)   | ~$0.02-0.05    |
-| Medium (5-15 files) | ~$0.05-0.15    |
-| Large (15+ files)   | ~$0.15-0.50    |
-
-Costs depend on diff size, not just file count. To reduce costs:
-
-- Use `model: anthropic/claude-haiku-4-5` for faster, cheaper reviews
-- Trigger reviews selectively (not on every push)
+\*API keys are optional when using the reusable workflow (credentials are fetched via OIDC). Only required when using the composite action directly without OIDC.
 
 ---
 
@@ -307,27 +247,6 @@ When no issues are found:
 
 ---
 
-## Progress Indicators
-
-### Check Runs
-
-When the workflow has `checks: write` permission, reviews appear as check runs on the PR's Checks tab. This makes it easy to see review status at a glance — `in_progress` while reviewing, then `success`, `failure`, or `cancelled` when done. If `checks: write` is not granted, the workflow still works normally without check runs.
-
-### Reactions
-
-The action also uses emoji reactions on your `/review` comment to indicate progress:
-
-| Stage             | Reaction | Meaning                        |
-| ----------------- | -------- | ------------------------------ |
-| Started           | 👀       | Review in progress             |
-| Approved          | 👍       | PR looks good, no issues found |
-| Changes requested | _(none)_ | Review posted with feedback    |
-| Error             | 😕       | Something went wrong           |
-
----
-
-## How It Works
-
 ### Review Pipeline
 
 ```
@@ -336,23 +255,22 @@ AGENTS.md + PR Diff → Drafter (hypotheses) → Verifier (confirm) → Post Com
 
 ### Learning System
 
-When you reply to a review comment, two things happen in parallel:
+When you reply to a review comment:
 
-**Synchronous reply** (`reply-to-feedback` job):
-
-1. Checks if the reply is to an agent comment (via `<!-- cagent-review -->` marker)
+1. The `reply-to-feedback` job checks if the reply is to an agent comment (via `<!-- cagent-review -->` marker)
 2. Verifies the author is an org member/collaborator (authorization gate)
 3. Builds the full thread context (original comment + all replies in chronological order)
 4. Runs a Sonnet-powered reply agent that posts a contextual response in the same thread
-5. The agent also stores learnings in the memory database for future reviews
+5. **Captures feedback as an artifact** — saves the comment JSON as a `pr-review-feedback` artifact
 
-**Async artifact capture** (`capture-feedback` job):
+On the **next review run** (on any PR in the same repo):
 
-1. Saves the feedback as a GitHub Actions artifact (no secrets required)
-2. On the next review run, pending feedback artifacts are downloaded and processed into the memory database
-3. Acts as a resilient fallback if the reply agent fails or isn't configured
+6. The review action downloads all pending `pr-review-feedback` artifacts
+7. A separate feedback agent processes each one and calls `add_memory` to record lessons learned
+8. The processed artifacts are deleted so they're not reprocessed
+9. The review agent has access to all accumulated memories, calibrating future reviews
 
-This dual approach means the developer gets an immediate conversational response while also ensuring learnings are captured even if the reply job encounters an issue.
+This means developer feedback on one PR improves reviews across all future PRs in the repo.
 
 ### Conversational Replies
 
@@ -431,108 +349,3 @@ Each eval file in `review-pr/agents/evals/` contains:
 ```
 
 > **Tip:** Create multiple eval files for the same PR to test consistency. If the agent produces different verdicts across runs, the failing evals highlight the inconsistency.
-
----
-
-## What It Reviews
-
-**Catches:** Logic errors, null dereferences, resource leaks, security issues, error handling mistakes, concurrency bugs
-
-**Context-aware:** Reads `AGENTS.md`/`CLAUDE.md` for project conventions and checks build files (e.g., `go.mod`, `package.json`) to validate findings against the project's actual toolchain version.
-
-**Ignores:** Style, formatting, documentation, test files, unchanged code
-
----
-
-## Fork PR Auto-Review
-
-`pull_request` events from forks can't access OIDC tokens, so auto-review is skipped. `/review` always works on fork PRs. If you want automatic fork PR reviews, add a trigger workflow that saves the PR number via `workflow_run`:
-
-**`.github/workflows/pr-review-trigger.yml`:**
-
-```yaml
-name: PR Review - Trigger
-on:
-  pull_request:
-    types: [ready_for_review, opened]
-jobs:
-  save-pr:
-    if: github.event.pull_request.head.repo.fork
-    runs-on: ubuntu-latest
-    steps:
-      - name: Save PR number
-        env:
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: printf '%s' "$PR_NUMBER" > pr_number.txt
-
-      - name: Upload PR context
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
-        with:
-          name: pr-review-context
-          path: pr_number.txt
-          retention-days: 1
-```
-
-Then add `workflow_run` to your main review workflow, download the artifact, and pass `pr-number` to the reusable workflow. `workflow_run` runs in the base repo context, so OIDC works:
-
-**`.github/workflows/pr-review.yml`:**
-
-```yaml
-name: PR Review
-on:
-  ...
-  workflow_run:
-    workflows: ["PR Review - Trigger"]
-    types: [completed]
-
-jobs:
-  get-pr-context:
-    runs-on: ubuntu-latest
-    outputs:
-      pr-number: ${{ steps.pr.outputs.number }}
-    steps:
-      - name: Download PR context
-        if: github.event_name == 'workflow_run'
-        uses: actions/download-artifact@VERSION
-        with:
-          name: pr-review-context
-          run-id: ${{ github.event.workflow_run.id }}
-          github-token: ${{ github.token }}
-  review:
-    needs: [get-pr-context]
-    uses: docker/cagent-action/.github/workflows/review-pr.yml@VERSION
-    with:
-      pr-number: ${{ needs.get-pr-context.outputs.pr-number }}
-    ...
-```
-
-## Troubleshooting
-
-**Review ran but no comments appeared?**
-
-- Check the workflow summary - it should say "Review posted successfully"
-- The agent always posts a review (approval or comments). If you see 👍 reaction, the PR was approved
-- Look at the PR's "Files changed" tab → "Viewed" dropdown to see review comments
-
-**No reaction on my `/review` comment?**
-
-- Ensure the workflow has `pull-requests: write` permission
-- Check if the `github-token` has access to react to comments
-
-**No check run showing on the PR?**
-
-- Add `checks: write` to your workflow permissions (it's optional — the review works without it)
-- Check runs are created for manual (`/review`) triggers. Auto-reviews from `pull_request` already appear as workflow runs natively
-
-**Learning doesn't seem to work?**
-
-- You must **reply directly** to an agent comment (use the reply button, not a new comment)
-- The agent detects its own comments via the `<!-- cagent-review -->` marker
-- Check Actions → Caches to verify `pr-review-memory-*` exists
-
-**Reviews are too slow?**
-
-- Large diffs take longer. Consider reviewing smaller PRs
-- Use `model: anthropic/claude-haiku-4-5` for faster (but less thorough) reviews
-
-**Clear the memory cache:** Actions → Caches → Delete `pr-review-memory-*`

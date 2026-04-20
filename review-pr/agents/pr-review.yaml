@@ -107,11 +107,16 @@ agents:
          and delegate them to the `verifier` in a single batch. Skip verification for "low" findings.
          Include the project context (from step 2) in the verifier delegation so it can validate
          findings against project-specific conventions (e.g., language version, available APIs).
+         For each finding, include the file path and line number so the verifier reads only the
+         relevant file instead of all changed files. Explicitly instruct the verifier: "Only read
+         the specific file for each finding — do NOT use read_multiple_files on all changed files."
          **ANTI-LOOP RULE**: Delegate to the verifier exactly ONCE with all findings. If the
          verifier returns an empty or malformed response, post a COMMENT review that includes
          the drafter's unverified findings with a note that verification was inconclusive.
          Do NOT approve — surface the raw findings so the author can evaluate them.
          Do NOT retry the delegation.
+         (Empty verdicts usually indicate the verifier exhausted its context budget by reading
+         too many files. The fallback preserves the drafter's analysis for the author.)
       6. Parse the verifier's JSON response (a `verdicts` array). Filter out DISMISSED verdicts and findings where
          `in_changed_code == false` or `in_diff == false`.
       7. **Verify line numbers** before posting (see below)
@@ -172,8 +177,11 @@ agents:
       ## Posting Format (GitHub posting mode)
 
       Read `/tmp/posting_format.md` for the full `jq`-based posting template.
-      Use `jq` (never raw `echo`) to build JSON. Each finding becomes an inline comment
-      with `<!-- cagent-review -->` marker on its own line. Do NOT include the marker in console mode.
+      Use `jq` (never raw `echo`) to build JSON. Write each comment body to a temp file
+      using a quoted heredoc (`<< 'EOF'`) and read it with `jq --rawfile` — NEVER use
+      `--arg body "$variable"` because shell quoting breaks on `"`, backticks, and `$`
+      in the body text. Each finding becomes an inline comment with `<!-- cagent-review -->`
+      marker on its own line. Do NOT include the marker in console mode.
 
       ## Console Format
 
@@ -364,7 +372,16 @@ agents:
                   enum: ["high", "medium", "low"]
                 category:
                   type: string
-                  enum: ["security", "logic_error", "resource_leak", "concurrency", "error_handling", "data_integrity", "other"]
+                  enum:
+                    [
+                      "security",
+                      "logic_error",
+                      "resource_leak",
+                      "concurrency",
+                      "error_handling",
+                      "data_integrity",
+                      "other",
+                    ]
                 issue:
                   type: string
                   description: "One-line summary"
@@ -374,7 +391,16 @@ agents:
                 in_diff:
                   type: boolean
                   description: "true if on a + line"
-              required: ["file", "line", "severity", "category", "issue", "details", "in_diff"]
+              required:
+                [
+                  "file",
+                  "line",
+                  "severity",
+                  "category",
+                  "issue",
+                  "details",
+                  "in_diff",
+                ]
               additionalProperties: false
           summary:
             type: string
@@ -387,7 +413,7 @@ agents:
         tools: [read_file, read_multiple_files, list_directory]
 
   verifier:
-    model: sonnet
+    model: sonnet-thinking
     description: Hypothesis Verifier
     instruction: |
       Verify a batch of bug hypotheses using available context.
@@ -426,6 +452,21 @@ agents:
       the diff context provided to you. Do NOT DISMISS a finding solely because you could not
       read the file — evaluate it based on the diff content instead. Only attempt to read each
       file once; if it's not found, move on.
+
+      ## Context Budget Awareness
+
+      You produce structured JSON output. Every file you read consumes context that competes
+      with your ability to reason and produce verdicts. To avoid returning empty verdicts:
+
+      - **Read only the file referenced in each finding** — do NOT read all changed files.
+        The orchestrator tells you which file and line each finding is about. Read only those files.
+      - **Prefer `read_file` over `read_multiple_files`** — read one file at a time, only when
+        needed for the specific finding you're verifying.
+      - **Skip large files you don't need** — if a finding is about `script.sh` line 130,
+        you don't need to read the 500-line workflow YAML that calls it.
+      - **You MUST produce one verdict per finding** — an empty `verdicts` array is never correct
+        when findings were provided. If context is exhausted and you cannot read the relevant file,
+        emit a verdict of LIKELY with a note that the file was not read — do not skip the finding entirely.
 
       ## File Reading Guardrails
 
@@ -466,6 +507,7 @@ agents:
         properties:
           verdicts:
             type: array
+            minItems: 1
             items:
               type: object
               properties:
@@ -486,7 +528,16 @@ agents:
                   description: "Explanation of verdict"
                 in_changed_code:
                   type: boolean
-              required: ["verdict", "file", "line", "severity", "issue", "details", "in_changed_code"]
+              required:
+                [
+                  "verdict",
+                  "file",
+                  "line",
+                  "severity",
+                  "issue",
+                  "details",
+                  "in_changed_code",
+                ]
               additionalProperties: false
         required: ["verdicts"]
         additionalProperties: false
