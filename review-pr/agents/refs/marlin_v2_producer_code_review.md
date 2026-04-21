@@ -86,6 +86,20 @@ Fields annotated with `pii_category` or `identity_namespace_type` feed the ident
 
 **FAIL** if `IngestionContext` fields (`ingested_at`, `sent_at`, `ip_address`, `source_partition`, `source_offset`, `client_id`) are set by the producer. These are ingestor-owned and will be overwritten.
 
+**FAIL** if a field annotated `personal_data_type = PERSONAL_DATA_TYPE_EMBEDDED` (typically a URL) is forwarded verbatim from a user-provided or external source without stripping query parameters that are known PII vectors. Look for these patterns:
+
+```typescript
+// FAIL — URL forwarded as-is; may contain email=, token=, access_token=, etc.
+marlin.track(new PageView({ url: window.location.href }));
+marlin.track(new PageView({ url: req.headers.referer }));
+
+// PASS — query string is stripped or an allow-list is applied
+const safeUrl = stripPiiParams(window.location.href); // removes email=, token=, etc.
+marlin.track(new PageView({ url: safeUrl }));
+```
+
+Specifically **FAIL** if the URL value may contain any of: `email=`, `token=`, `access_token=`, `reset_token=`, `invite_token=`, `password=`, or any parameter whose name suggests a credential or identity. **WARN** if the URL comes from an internal redirect or API response where PII presence cannot be confirmed from the diff alone.
+
 **WARN** if the same `account_id` string is used for both the actor and subject when they refer to different entities (e.g., an org admin acting on another user's account).
 
 ---
@@ -157,7 +171,9 @@ marlin.track(new UserLogin({ account_id: session.hubUuid, ... }));
 
 **FAIL** if a field annotated with a regex `pattern` receives a value that the author has not verified matches the pattern. Look for untested user input or values from external APIs.
 
-**FAIL** if a `repeated` field with `max_items` sends more items than the limit at any realistic call site (e.g., passing `allClasses` where the element might have 100+ classes but the limit is 50).
+**FAIL** if a `repeated` field with `max_items` is passed an explicitly unbounded collection — one fetched without a limit clause, derived from a full table scan, or documented as potentially large (e.g., `allClasses` where the element is known to have 100+ classes but the limit is 50).
+
+**WARN** if a `repeated` field with `max_items` is passed a collection whose upper bound cannot be determined from the diff alone (e.g., a variable passed in from a caller not visible in the PR). Flag it as a potential overflow risk for the author to confirm.
 
 ---
 
@@ -193,6 +209,7 @@ Each event declares which platform(s) it belongs to via `platform_contexts`. The
 | `PLATFORM_CONTEXT_DESKTOP` | `app_version_major/minor/patch`, `app_build`, `os_name`, `os_major/minor/patch_version`, `os_language` |
 | `PLATFORM_CONTEXT_WEB` | A `WebContext` must be active in the SDK (URL, referrer) |
 | `PLATFORM_CONTEXT_HUB` | A `HubContext` must be active |
+| `PLATFORM_CONTEXT_NODE` | `node_version`, `service_name` must be set; `environment` (e.g., `production`, `staging`) must be set and must not be user-supplied |
 
 **WARN** if an event declares multiple `platform_contexts` but the call site only ever fires it from one platform. Consider whether the event should be split.
 
@@ -223,7 +240,7 @@ marlin.track(new CheckoutFlow({ action: req.body.step }));
 marlin.track(new CheckoutFlow({ action: "select_plan" }));
 ```
 
-**FAIL** if a new `action` value is introduced in the PR without updating the `Enums` section of the companion `catalog/docs/` markdown file.
+**WARN** if a new `action` value is introduced in the PR without updating the `Enums` section of the companion `catalog/docs/` markdown file. (See also Section 4 — this is Medium severity, not blocking.)
 
 **WARN** if an `action` value is a past-tense verb (`clicked`, `submitted`). Prefer present-tense or noun form matching the event name style (`click`, `submit`, `view`).
 
@@ -243,7 +260,23 @@ login_at: "2024-01-01T00:00:00Z"
 login_at: Timestamp.fromDate(new Date())
 ```
 
-**FAIL** if `created_at` on the envelope (`MarlinEvent.created_at`) is set manually by the producer. The SDK owns this field.
+**FAIL** if `created_at` on the **envelope** (`MarlinEvent.created_at`) is set manually by the producer. The SDK owns this field. Note: this is distinct from a payload-level `created_at` on an inner event struct (e.g., `MarlinEvent.payload.UserLogin.created_at`), which the producer may set to record when the real-world event occurred. Use the proto type hierarchy or language-specific type information to distinguish the two:
+
+```typescript
+// FAIL — setting the envelope timestamp; the SDK owns this
+marlinEvent.created_at = Timestamp.fromDate(loginTime);
+
+// PASS — setting a payload-level field on the inner event struct
+new UserLogin({ created_at: Timestamp.fromDate(loginTime) });
+```
+
+```go
+// FAIL — MarlinEvent is the envelope type
+event.CreatedAt = timestamppb.New(loginTime)
+
+// PASS — UserLogin is the inner payload type
+payload := &eventv1.UserLogin{CreatedAt: timestamppb.New(loginTime)}
+```
 
 **WARN** if a business-domain timestamp (e.g., `login_at`, `created_at` on the payload) is set to `Date.now()` / `new Date()` when the actual event time is known from a server response. Use the server-returned time.
 
@@ -255,7 +288,7 @@ Fields participating in the identity graph have `identity_namespace_type` annota
 
 **FAIL** if the same field is given different types of identifiers at different call sites. For example, passing an org ID into `account_id` (which is a `hub_uuid` namespace field) when the field is meant for user UUIDs.
 
-**FAIL** if an identity field changes value mid-session without a corresponding `Identify` or `Alias` SDK call. For example, `account_id` should not change from an anonymous ID to a logged-in user UUID without resetting the session.
+**WARN** if two or more `track()` call sites visible in the diff appear to be within the same user flow or session scope and pass structurally different values to the same identity field (e.g., an anonymous ID in one call and an authenticated UUID in another) without a visible `Identify` or `Alias` SDK call between them. Static analysis cannot determine session boundaries across the full runtime — flag only when the same-session relationship is reasonably evident from the diff (e.g., both calls are in the same function, same request handler, or same component lifecycle).
 
 **WARN** if `session_id` is re-used across browser sessions (e.g., persisted to `localStorage` across tabs or across page reloads without a new `SessionStart`). Session IDs should be ephemeral.
 
