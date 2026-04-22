@@ -18,7 +18,7 @@ Apply this guide when the PR diff contains **any** of the following:
 | TypeScript / JavaScript | `from "@docker/data-contracts"` or `require("@docker/data-contracts")` |
 | Python | `from docker.marlin` or `import docker.marlin` |
 
-Also apply if the diff contains a direct `marlin.track(` or `.track(new ` call, even without a visible import (the import may be in a file outside the diff).
+Also apply if the diff contains a direct `marlin.track(` call without a visible import (the import may be in a file outside the diff). Apply for the unqualified `.track(new ` pattern only when at least one additional Marlin-specific signal is present in the same diff hunk — for example, a recognized Marlin event class name (e.g., `new WebClick(`, `new CheckoutFlow(`), or the presence of a `string_kind` or `platform_context` field.
 
 If none of the above patterns appear, skip this guide entirely.
 
@@ -30,7 +30,7 @@ When the trigger patterns are present, read these files from the repository bein
 2. **SDK initialization** — find where `new MarlinClient(...)`, `initMarlin(...)`, or the equivalent is called. Verify it runs before any `track()` call site in the diff.
 3. **Auth / session context** — if the diff reads `session.*`, `token.Claims.*`, `req.user.*`, or similar to populate identity fields, read that file to confirm the value is server-side and not user-supplied.
 
-Do not speculatively read companion proto docs — those live in a separate repository. Apply the rules in this guide based on the field names and values visible in the diff.
+Do not speculatively read companion proto definitions — those live in a separate repository. Exception: `catalog/docs/` markdown files located inside the repository being reviewed are in scope — read them when checking Sections 4, 7, and 11. Apply all other rules based on the field names and values visible in the diff.
 
 ### Call patterns by language
 
@@ -121,9 +121,9 @@ marlin.track(new WebClick({ action: req.body.action }));
 marlin.track(new WebClick({ action: "open_dropdown" }));
 ```
 
-**FAIL** if a `STRING_KIND_FREE` field receives a hard-coded constant that the user cannot influence. This misclassification skips scrutiny on data that needs it:
+**WARN** if a `STRING_KIND_FREE` field receives a hard-coded constant. A constant here means the field never captures real user data, defeating the purpose of the STRING_KIND_FREE classification:
 ```typescript
-// FAIL — search_query is STRING_KIND_FREE; passing a constant bypasses the point
+// WARN — search_query is STRING_KIND_FREE; passing a constant bypasses the point
 marlin.track(new DhiCatalogSearch({ search_query: "official" }));
 
 // PASS — pass the actual query the user entered
@@ -140,12 +140,14 @@ Every field annotated `(buf.validate.field) = {required: true}` must be populate
 
 **Envelope-level required fields** (always checked, regardless of event type):
 
-| Field | Constraint |
-|---|---|
-| `event_schema_version` | Non-empty string |
-| `event_id` | Valid UUID v4 |
-| `process_id` | Valid UUID v4 |
-| `process_sequence_number` | Integer ≥ 0, monotonically increasing per process |
+| Field | Constraint | Ownership |
+|---|---|---|
+| `event_schema_version` | Non-empty string | SDK — set automatically; producer must not override |
+| `event_id` | Valid UUID v4 | SDK — set automatically; producer must not override |
+| `process_id` | Valid UUID v4 | SDK — set automatically; producer must not override |
+| `process_sequence_number` | Integer ≥ 0, monotonically increasing per process | SDK — set automatically; producer must not override |
+
+The SDK auto-populates all four fields above. Only check them if the PR explicitly overrides them — if it does, apply the FAIL patterns below.
 
 **FAIL** for any of these patterns:
 ```typescript
@@ -161,7 +163,7 @@ process_sequence_number: 0  // reset each call
 
 **PASS** pattern:
 ```typescript
-// Delegate to the SDK — it generates event_id, process_id, sequence automatically
+// Delegate to the SDK — it generates event_id, process_id, sequence, and event_schema_version automatically
 marlin.track(new UserLogin({ account_id: session.hubUuid, ... }));
 ```
 
@@ -190,7 +192,7 @@ app_name: AppName.APP_NAME_HUB
 
 **FAIL** if an enum field that represents a closed vocabulary (e.g., `auth_method`, `os_name`, `environment`) receives a user-supplied string that may not be in the enum. These fields should always be a switch/if over a known set of values.
 
-**WARN** if a new string value is being passed to a field that acts as an open enum (e.g., `action` on a flow event). Verify the value is documented in the companion `catalog/docs/` file and follows the existing naming convention for that event.
+**WARN** if a new string value is introduced for a field that maintains a documented closed vocabulary (e.g., `action` on a flow event). Verify the value is documented in the companion `catalog/docs/` file and follows the existing naming convention for that event. (See also Section 7.)
 
 ---
 
@@ -219,11 +221,11 @@ Each event declares which platform(s) it belongs to via `platform_contexts`. The
 
 Fields annotated `personal_data_type = PERSONAL_DATA_TYPE_UGC` and `string_kind = STRING_KIND_FREE` carry content the user typed or controlled. These fields receive extra pipeline scrutiny, but the producer still has responsibilities.
 
-**FAIL** if UGC is truncated or sanitized before sending in a way that loses fidelity but retains risk. Either send the full value (and let the pipeline handle it) or do not send it at all.
+**FAIL** if UGC is truncated in a way that strips a PII-bearing value mid-string and leaves a partial value that still retains risk (e.g., slicing `user@example.com` to `user@example`). Send the full value and let the pipeline handle it, or omit the field entirely.
 
-**FAIL** if a UGC field is populated with a value from an external API response that is itself user-controlled (e.g., a Docker Hub description, a repository README, or a user-supplied label) unless the field's `string_kind` is `STRING_KIND_FREE`.
+**PASS** if a hard size cap is applied before sending (e.g., slicing to 10 KB). This is acceptable to protect downstream systems. The cap position must not predictably split a sensitive token at a known offset.
 
-**WARN** if a UGC field is populated with values longer than 500 characters without a truncation guard. The pipeline can handle large payloads, but extremely long values (>10 KB) can cause issues downstream.
+**WARN** if a UGC field can receive values larger than 10 KB in production and there is no truncation guard at the call site. Extremely large values can cause issues downstream.
 
 ---
 
@@ -310,6 +312,33 @@ useEffect(() => {
 }, []);
 ```
 
+**FAIL** if an event is fired inside a tight goroutine loop or a polling ticker without a per-event guard (Go):
+```go
+// FAIL — fires on every tick
+for range ticker.C {
+    marlin.Track(ctx, &eventv1.HealthCheck{ ... })
+}
+
+// PASS — guard with a condition or fire outside the loop
+if stateChanged {
+    marlin.Track(ctx, &eventv1.HealthCheck{ ... })
+}
+```
+
+**FAIL** if an event is fired at the top level of a Python request handler with no condition, causing it to fire on every request regardless of the intended trigger:
+```python
+# FAIL — fires on every HTTP request
+def handle_request(request):
+    marlin.track(web_click_pb2.WebClick( ... ))
+    return process(request)
+
+# PASS — fire only on the specific action that warrants it
+def handle_request(request):
+    if request.method == "POST" and request.path == "/checkout":
+        marlin.track(checkout_pb2.CheckoutFlow( ... ))
+    return process(request)
+```
+
 **FAIL** if an event is fired before the SDK is initialized. Check for initialization guards or early-return conditions.
 
 **WARN** if the same event is fired more than once for a single user action with no deduplication mechanism. `event_id` provides at-least-once deduplication downstream, but repeated firing inflates metrics.
@@ -327,7 +356,7 @@ catalog/docs/docker/marlin/<team>/event/v1/<event_name>.md
 
 **FAIL** if the PR adds a new event without a companion doc.
 
-**FAIL** if the PR changes a field (added, removed, renamed, type changed) and the companion doc is not updated to match.
+**FAIL** if the PR changes a field (added, removed, renamed, type changed) and the companion doc is not updated to match. Exception: adding a new `action` value to a flow event is handled at Section 7 severity (WARN / Medium) rather than FAIL, because the field itself is not changing — only its documented vocabulary is being extended.
 
 **WARN** if the Example payload in the doc uses field names or values that no longer match the current proto schema.
 
@@ -339,7 +368,7 @@ When a PR contains Marlin SDK `track()` calls, produce a dedicated **Marlin SDK 
 
 Structure the block as follows:
 
-```
+````
 Here's the Marlin SDK analysis:
 
 ---
@@ -371,7 +400,7 @@ In `[function]` ([file:line]):
 ### Recommendations
 
 [Numbered list of concrete fixes, one per concern above. If no concerns, omit this section.]
-```
+````
 
 #### Severity mapping
 
